@@ -20,9 +20,24 @@ use wdtt_proto::{
 };
 use wdtt_turn::{TurnClient, TurnClientConfig, TurnError, TurnIncoming};
 
-const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(45);
 const RESEQUENCER_TICK_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_PACKET_LEN: usize = 2048;
+const DEFAULT_SESSION_TTL: Duration = Duration::from_secs(300);
+
+/// Helper to create and bind non-blocking UDP socket with 4 MB send/recv buffers.
+fn bind_tuned_udp_socket(addr: SocketAddr) -> Result<UdpSocket, std::io::Error> {
+    let domain = match addr {
+        SocketAddr::V4(_) => socket2::Domain::IPV4,
+        SocketAddr::V6(_) => socket2::Domain::IPV6,
+    };
+    let sock2 = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
+    sock2.set_nonblocking(true)?;
+    let _ = sock2.set_recv_buffer_size(4 * 1024 * 1024);
+    let _ = sock2.set_send_buffer_size(4 * 1024 * 1024);
+    sock2.bind(&addr.into())?;
+    let std_socket: std::net::UdpSocket = sock2.into();
+    UdpSocket::from_std(std_socket)
+}
 
 /// Error type for tunnel session operations.
 #[derive(Debug, thiserror::Error)]
@@ -88,6 +103,28 @@ pub struct TunnelServerConfig {
     pub psk: [u8; 32],
 }
 
+/// Authorized client session state tracked by the server.
+#[derive(Debug, Clone)]
+pub struct AuthorizedClientSession {
+    /// Relayed address of the client on the TURN server.
+    pub relayed_addr: SocketAddr,
+    /// Unique session identifier from the client's knock.
+    pub session_id: [u8; 16],
+    /// When the session was first authenticated.
+    pub authorized_at: Instant,
+    /// When the last valid packet was received from the client.
+    pub last_activity: Instant,
+    /// Session expiration duration without activity.
+    pub session_ttl: Duration,
+}
+
+impl AuthorizedClientSession {
+    /// Whether the session has timed out due to inactivity.
+    pub fn is_expired(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.last_activity) >= self.session_ttl
+    }
+}
+
 /// Client tunnel session terminating local WireGuard and relaying via TURN.
 pub struct TunnelClient {
     config: TunnelClientConfig,
@@ -119,7 +156,7 @@ impl TunnelClient {
             self.config.server_relayed_addr, self.config.turn_server_addr
         );
 
-        let wg_socket = UdpSocket::bind(self.config.wg_listen_addr).await?;
+        let wg_socket = bind_tuned_udp_socket(self.config.wg_listen_addr)?;
         info!("WireGuard bridge listening on {}", wg_socket.local_addr()?);
 
         let turn_cfg = TurnClientConfig {
@@ -143,6 +180,11 @@ impl TunnelClient {
             .bind_peer(self.config.server_relayed_addr)
             .await?;
         info!("Client bound peer {}", self.config.server_relayed_addr);
+
+        // Derive dynamic refresh intervals from negotiated TURN LIFETIME
+        let mut alloc_refresh_timer = interval(turn_client.allocation_refresh_interval());
+        let mut perm_refresh_timer = interval(turn_client.permission_refresh_interval());
+        let mut chan_bind_refresh_timer = interval(turn_client.channel_bind_refresh_interval());
 
         // Send Pre-Auth Knock
         let knock_key = derive_pre_auth_knock_key(&Psk::from_bytes(self.config.psk));
@@ -176,7 +218,6 @@ impl TunnelClient {
 
         let mut wg_buf = vec![0u8; MAX_PACKET_LEN];
         let mut turn_buf = vec![0u8; MAX_PACKET_LEN];
-        let mut keepalive_timer = interval(KEEP_ALIVE_INTERVAL);
         let mut tick_timer = interval(RESEQUENCER_TICK_INTERVAL);
 
         loop {
@@ -198,14 +239,23 @@ impl TunnelClient {
                     }
                 }
 
-                _ = keepalive_timer.tick() => {
-                    trace!("TunnelClient refreshing TURN allocation & permissions");
-                    if let Err(e) = turn_client.refresh_allocation(600).await {
+                _ = alloc_refresh_timer.tick() => {
+                    let requested_sec = turn_client.negotiated_lifetime();
+                    trace!("TunnelClient dynamically refreshing TURN allocation ({requested_sec}s)");
+                    if let Err(e) = turn_client.refresh_allocation(requested_sec).await {
                         warn!("Failed to refresh TURN allocation: {e}");
                     }
+                }
+
+                _ = perm_refresh_timer.tick() => {
+                    trace!("TunnelClient dynamically refreshing TURN permission");
                     if let Err(e) = turn_client.refresh_permission().await {
                         warn!("Failed to refresh TURN permission: {e}");
                     }
+                }
+
+                _ = chan_bind_refresh_timer.tick() => {
+                    trace!("TunnelClient dynamically refreshing TURN channel bind");
                     if let Err(e) = turn_client.refresh_channel_bind().await {
                         warn!("Failed to refresh TURN channel bind: {e}");
                     }
@@ -333,7 +383,7 @@ impl TunnelServer {
             self.config.turn_server_addr, self.config.wg_endpoint_addr
         );
 
-        let wg_socket = UdpSocket::bind("0.0.0.0:0").await?;
+        let wg_socket = bind_tuned_udp_socket("0.0.0.0:0".parse().unwrap())?;
         info!("Server WG forwarder bound to {}", wg_socket.local_addr()?);
 
         let turn_cfg = TurnClientConfig {
@@ -360,16 +410,19 @@ impl TunnelServer {
             let _ = tx.send(my_relayed);
         }
 
+        // Derive dynamic refresh intervals from negotiated TURN LIFETIME
+        let mut alloc_refresh_timer = interval(turn_client.allocation_refresh_interval());
+        let mut perm_refresh_timer = interval(turn_client.permission_refresh_interval());
+        let mut chan_bind_refresh_timer = interval(turn_client.channel_bind_refresh_interval());
+
         let knock_key = derive_pre_auth_knock_key(&Psk::from_bytes(self.config.psk));
         let mut auth = KnockAuthenticator::new(knock_key, DEFAULT_MAX_CLOCK_SKEW_SEC);
 
-        let mut client_relayed_addr: Option<SocketAddr> = None;
-        let mut authenticated = false;
+        let mut active_session: Option<AuthorizedClientSession> = None;
         let mut seq_tx: u16 = 0;
 
         let mut wg_buf = vec![0u8; MAX_PACKET_LEN];
         let mut turn_buf = vec![0u8; MAX_PACKET_LEN];
-        let mut keepalive_timer = interval(KEEP_ALIVE_INTERVAL);
 
         loop {
             tokio::select! {
@@ -380,15 +433,26 @@ impl TunnelServer {
                     }
                 }
 
-                _ = keepalive_timer.tick() => {
-                    trace!("TunnelServer refreshing TURN allocation");
-                    if let Err(e) = turn_client.refresh_allocation(600).await {
+                _ = alloc_refresh_timer.tick() => {
+                    let requested_sec = turn_client.negotiated_lifetime();
+                    trace!("TunnelServer dynamically refreshing TURN allocation ({requested_sec}s)");
+                    if let Err(e) = turn_client.refresh_allocation(requested_sec).await {
                         warn!("Failed to refresh TURN allocation: {e}");
                     }
-                    if authenticated {
+                }
+
+                _ = perm_refresh_timer.tick() => {
+                    if active_session.is_some() {
+                        trace!("TunnelServer dynamically refreshing TURN permission");
                         if let Err(e) = turn_client.refresh_permission().await {
                             warn!("Failed to refresh TURN permission: {e}");
                         }
+                    }
+                }
+
+                _ = chan_bind_refresh_timer.tick() => {
+                    if active_session.is_some() {
+                        trace!("TunnelServer dynamically refreshing TURN channel bind");
                         if let Err(e) = turn_client.refresh_channel_bind().await {
                             warn!("Failed to refresh TURN channel bind: {e}");
                         }
@@ -399,9 +463,12 @@ impl TunnelServer {
                 incoming_res = turn_client.recv_incoming(&mut turn_buf) => {
                     match incoming_res {
                         Ok(Some(turn_msg)) => {
-                            let (peer, payload) = match turn_msg {
+                            let (peer_from_turn, payload) = match turn_msg {
                                 TurnIncoming::DataIndication { peer_addr, payload } => (Some(peer_addr), payload),
-                                TurnIncoming::ChannelData { payload, .. } => (client_relayed_addr, payload),
+                                TurnIncoming::ChannelData { payload, .. } => (
+                                    active_session.as_ref().map(|s| s.relayed_addr),
+                                    payload,
+                                ),
                                 _ => (None, bytes::Bytes::new()),
                             };
 
@@ -409,46 +476,100 @@ impl TunnelServer {
                                 continue;
                             }
 
-                            if !authenticated {
-                                // Must be a valid HandshakeInit (Pre-Auth Knock)
-                                if let Ok((view, _)) = FrameView::decode(&payload)
-                                    && view.header.frame_type == FrameType::HandshakeInit
-                                {
-                                    let now_sec = SystemTime::now()
-                                        .duration_since(UNIX_EPOCH)
-                                        .unwrap()
-                                        .as_secs();
+                            let now = Instant::now();
 
-                                    match auth.verify_knock_packet(now_sec, view.payload) {
-                                        Ok(_payload) => {
-                                            info!("Pre-Auth Knock verified successfully!");
-                                            authenticated = true;
-                                            if let Some(p) = peer {
-                                                client_relayed_addr = Some(p);
-                                                if let Err(e) = turn_client.bind_peer(p).await {
-                                                    warn!("Failed to bind peer {p} on TURN: {e}");
-                                                }
+                            // 1. Session expiration check
+                            if let Some(ref session) = active_session
+                                && session.is_expired(now)
+                            {
+                                info!(
+                                    "Client session {} expired due to inactivity (TTL {:?})",
+                                    session.relayed_addr, session.session_ttl
+                                );
+                                active_session = None;
+                            }
+
+                            // 2. Check for Pre-Auth Knock (HandshakeInit) - works for initial auth AND port reuse/reconnect!
+                            if let Ok((view, _)) = FrameView::decode(&payload)
+                                && view.header.frame_type == FrameType::HandshakeInit
+                            {
+                                let now_sec = SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .unwrap()
+                                    .as_secs();
+
+                                match auth.verify_knock_packet(now_sec, view.payload) {
+                                    Ok(knock_payload) => {
+                                        let client_peer = peer_from_turn
+                                            .or_else(|| active_session.as_ref().map(|s| s.relayed_addr));
+
+                                        if let Some(peer) = client_peer {
+                                            info!(
+                                                "Pre-Auth Knock verified for peer {} (session {:?})!",
+                                                peer, knock_payload.session_id
+                                            );
+
+                                            // Re-bind peer on TURN (handles port migration or fresh binding)
+                                            if let Err(e) = turn_client.bind_peer(peer).await {
+                                                warn!("Failed to bind peer {peer} on TURN: {e}");
                                             }
+
+                                            active_session = Some(AuthorizedClientSession {
+                                                relayed_addr: peer,
+                                                session_id: knock_payload.session_id,
+                                                authorized_at: now,
+                                                last_activity: now,
+                                                session_ttl: DEFAULT_SESSION_TTL,
+                                            });
 
                                             // Send HandshakeResp
                                             let mut resp_frame = BytesMut::new();
-                                            encode_frame(FrameType::HandshakeResp, 0, 0, 0, b"WDTT2-OK", &mut resp_frame);
+                                            encode_frame(
+                                                FrameType::HandshakeResp,
+                                                0,
+                                                0,
+                                                0,
+                                                b"WDTT2-OK",
+                                                &mut resp_frame,
+                                            );
                                             let _ = turn_client.send_channel_data(&resp_frame).await;
-                                        }
-                                        Err(e) => {
-                                            // SILENT DISCARD (zero bytes returned, no response)
-                                            debug!("Invalid knock rejected silently: {e}");
+                                        } else {
+                                            debug!("Knock verified but peer address unknown; silent discard");
                                         }
                                     }
+                                    Err(e) => {
+                                        // SILENT DISCARD (zero bytes returned, no response)
+                                        debug!("Invalid knock rejected silently: {e}");
+                                    }
                                 }
-                            } else {
-                                // Authenticated data forwarding
+                                continue;
+                            }
+
+                            // 3. Authenticated Data forwarding
+                            if let Some(ref mut session) = active_session {
+                                // Address & Port verification: drop packets spoofed from different peers
+                                if let Some(peer) = peer_from_turn
+                                    && peer != session.relayed_addr
+                                {
+                                    debug!(
+                                        "Packet from unauthorized peer {peer} silently dropped; expected {}",
+                                        session.relayed_addr
+                                    );
+                                    continue;
+                                }
+
                                 if let Ok((view, _)) = FrameView::decode(&payload)
                                     && view.header.frame_type == FrameType::Data
                                 {
+                                    session.last_activity = now;
                                     self.metrics.record_rx(view.payload.len());
-                                    let _ = wg_socket.send_to(view.payload, self.config.wg_endpoint_addr).await;
+                                    let _ = wg_socket
+                                        .send_to(view.payload, self.config.wg_endpoint_addr)
+                                        .await;
                                 }
+                            } else {
+                                // SILENT DISCARD: non-handshake packet received without authenticated session
+                                debug!("Unauthenticated data packet dropped silently");
                             }
                         }
                         Ok(None) => {}
@@ -458,8 +579,8 @@ impl TunnelServer {
                     }
                 }
 
-                // Packets from WireGuard endpoint -> send over TURN to client
-                res = wg_socket.recv_from(&mut wg_buf), if authenticated => {
+                // Packets from WireGuard endpoint -> send over TURN to client (only if authenticated)
+                res = wg_socket.recv_from(&mut wg_buf), if active_session.is_some() => {
                     match res {
                         Ok((len, _src)) => {
                             let payload = &wg_buf[..len];

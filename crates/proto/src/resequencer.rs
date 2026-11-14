@@ -183,7 +183,15 @@ impl ReceiverStreamState {
     }
 
     /// Fast-forward expected counter past dropped/stale gaps up to `new_expected`.
+    ///
+    /// Rejects catastrophic forward jumps beyond `MAX_FORWARD_COUNTER_JUMP` to protect the window.
     fn advance_to(&mut self, new_expected: u64, out: &mut Vec<Bytes>) {
+        let delta = new_expected.saturating_sub(self.expected_counter);
+        if delta > MAX_FORWARD_COUNTER_JUMP {
+            self.stats.packets_invalid_counter_jump += 1;
+            return;
+        }
+
         while self.expected_counter < new_expected {
             let slot_idx = (self.expected_counter as usize) & self.mask;
             if let Some(entry) = self.slots[slot_idx].take()
@@ -384,6 +392,24 @@ mod tests {
         // Next legitimate packet 1 still accepted in order
         reseq.push(1, 1, Bytes::from_static(b"p1"), now, &mut out);
         assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn test_advance_to_bound_check() {
+        let now = Instant::now();
+        let mut stream = ReceiverStreamState::new(1, 1024, DEFAULT_GAP_TIMEOUT, now);
+        let mut out = Vec::new();
+        assert_eq!(stream.expected_counter, 0);
+
+        // Jump exceeding MAX_FORWARD_COUNTER_JUMP
+        stream.advance_to(100_000, &mut out);
+        assert_eq!(stream.expected_counter, 0);
+        assert_eq!(stream.stats.packets_invalid_counter_jump, 1);
+
+        // Valid jump
+        stream.advance_to(10, &mut out);
+        assert_eq!(stream.expected_counter, 10);
+        assert_eq!(stream.stats.packets_invalid_counter_jump, 1);
     }
 
     #[test]

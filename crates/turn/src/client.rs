@@ -67,12 +67,25 @@ pub struct TurnClient {
     nonce: String,
     key: [u8; 16],
     allocated: Arc<AtomicBool>,
+    negotiated_lifetime_sec: u32,
 }
 
 impl TurnClient {
-    /// Create a new TURN client bound to an ephemeral local UDP port.
+    /// Create a new TURN client bound to an ephemeral local UDP port with tuned socket buffers.
     pub async fn bind(local_bind: SocketAddr, config: TurnClientConfig) -> Result<Self, TurnError> {
-        let socket = UdpSocket::bind(local_bind).await?;
+        let domain = match local_bind {
+            SocketAddr::V4(_) => socket2::Domain::IPV4,
+            SocketAddr::V6(_) => socket2::Domain::IPV6,
+        };
+        let sock2 =
+            socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
+        sock2.set_nonblocking(true)?;
+        let _ = sock2.set_recv_buffer_size(4 * 1024 * 1024);
+        let _ = sock2.set_send_buffer_size(4 * 1024 * 1024);
+        sock2.bind(&local_bind.into())?;
+        let std_socket: std::net::UdpSocket = sock2.into();
+        let socket = UdpSocket::from_std(std_socket)?;
+        let lifetime = config.lifetime_sec;
         Ok(Self {
             socket: Arc::new(socket),
             config,
@@ -81,7 +94,31 @@ impl TurnClient {
             nonce: String::new(),
             key: [0u8; 16],
             allocated: Arc::new(AtomicBool::new(false)),
+            negotiated_lifetime_sec: lifetime,
         })
+    }
+
+    /// Return negotiated allocation lifetime in seconds received from TURN server.
+    pub fn negotiated_lifetime(&self) -> u32 {
+        self.negotiated_lifetime_sec
+    }
+
+    /// Return dynamic refresh interval for allocation (75% of server lifetime).
+    pub fn allocation_refresh_interval(&self) -> Duration {
+        let sec = (self.negotiated_lifetime_sec as u64 * 3) / 4;
+        Duration::from_secs(sec.max(10))
+    }
+
+    /// Return dynamic refresh interval for permissions (RFC 5766 Sec 8: 75% of min(300, lifetime)).
+    pub fn permission_refresh_interval(&self) -> Duration {
+        let sec = 300.min(self.negotiated_lifetime_sec as u64);
+        Duration::from_secs(((sec * 3) / 4).max(10))
+    }
+
+    /// Return dynamic refresh interval for channel binding (RFC 5766 Sec 11: 75% of min(600, lifetime)).
+    pub fn channel_bind_refresh_interval(&self) -> Duration {
+        let sec = 600.min(self.negotiated_lifetime_sec as u64);
+        Duration::from_secs(((sec * 3) / 4).max(10))
     }
 
     /// Retrieve the allocated relayed address, if allocation succeeded.
@@ -144,8 +181,14 @@ impl TurnClient {
         let relayed_addr = alloc_resp
             .relayed_address()
             .ok_or(TurnError::MissingAttribute("XOR-RELAYED-ADDRESS"))?;
+        if let Some(lifetime) = alloc_resp.lifetime() {
+            self.negotiated_lifetime_sec = lifetime;
+        }
         self.relayed_addr = Some(relayed_addr);
-        info!("TURN allocation granted: relayed addr = {relayed_addr}");
+        info!(
+            "TURN allocation granted: relayed addr = {relayed_addr}, lifetime = {}s",
+            self.negotiated_lifetime_sec
+        );
 
         self.allocated.store(true, Ordering::SeqCst);
         Ok(relayed_addr)
@@ -184,6 +227,7 @@ impl TurnClient {
         }
 
         let granted = resp.lifetime().unwrap_or(lifetime_sec);
+        self.negotiated_lifetime_sec = granted;
         debug!("TURN Refresh granted lifetime: {granted}s");
         Ok(granted)
     }
