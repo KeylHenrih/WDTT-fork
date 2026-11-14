@@ -1,4 +1,7 @@
-/target
+target/
+**/target/
+fuzz/corpus/
+fuzz/artifacts/
 **/*.rs.bk
 *.swp
 *.orig
