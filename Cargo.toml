@@ -1,0 +1,68 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/proto",
+    "crates/crypto",
+    "crates/turn",
+    "crates/provider",
+    "crates/core",
+    "crates/tun",
+    "crates/ipc",
+    "crates/server",
+    "crates/daemon",
+    "crates/gui-desktop",
+    "crates/ffi-android",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+authors = ["Antigravity <antigravity@local>"]
+repository = "https://github.com/wdtt-rs/wdtt"
+readme = "README.md"
+
+[workspace.dependencies]
+# Core utilities
+bytes = "1.10"
+thiserror = "2.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio = { version = "1.43", features = ["full"] }
+async-trait = "0.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+postcard = { version = "1.1", features = ["alloc"] }
+url = "2.5"
+siphasher = "1.0"
+
+# Cryptography
+chacha20poly1305 = "0.10"
+aes-gcm = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+hmac = "0.12"
+zeroize = { version = "1.8", features = ["derive"] }
+subtle = "2.6"
+rand = "0.9"
+
+# Workspace crates
+wdtt-proto = { path = "crates/proto" }
+wdtt-crypto = { path = "crates/crypto" }
+wdtt-turn = { path = "crates/turn" }
+wdtt-provider = { path = "crates/provider" }
+wdtt-core = { path = "crates/core" }
+wdtt-tun = { path = "crates/tun" }
+wdtt-ipc = { path = "crates/ipc" }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.bench]
+opt-level = 3
+lto = "fat"
+codegen-units = 1

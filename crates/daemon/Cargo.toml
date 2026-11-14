@@ -1,0 +1,21 @@
+[package]
+name = "wdttd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "wdttd"
+path = "src/main.rs"
+
+[dependencies]
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tokio = { workspace = true }
+wdtt-proto = { workspace = true }
+wdtt-core = { workspace = true }
+wdtt-tun = { workspace = true }
+wdtt-ipc = { workspace = true }

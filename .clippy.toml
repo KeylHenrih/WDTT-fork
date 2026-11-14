@@ -1,0 +1,24 @@
+# Clippy configuration for wdtt-rs
+avoid-breaking-exported-api = true
+cognitive-complexity-threshold = 25
+doc-valid-idents = [
+    "WireGuard",
+    "DTLS",
+    "STUN",
+    "TURN",
+    "WebRTC",
+    "Opus",
+    "SipHash",
+    "HKDF",
+    "AEAD",
+    "ChaCha20",
+    "Poly1305",
+    "AES",
+    "GCM",
+    "SSRC",
+    "MTU",
+    "RTT",
+    "FIFO",
+    "Postcard",
+    "UniFFI",
+]
