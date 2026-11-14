@@ -328,6 +328,11 @@ impl WgResequencer {
             .find(|s| s.receiver_index == receiver_index)
             .map(|s| s.stats)
     }
+
+    /// Check if all managed streams have empty slot queues (no gaps waiting for timeout).
+    pub fn is_empty(&self) -> bool {
+        self.streams.iter().all(|s| s.gap_started_at.is_none())
+    }
 }
 
 #[cfg(test)]

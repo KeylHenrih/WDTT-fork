@@ -9,6 +9,7 @@
 
 use std::io;
 use std::net::SocketAddr;
+#[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::Arc;
 use tokio::io::Interest;
@@ -66,86 +67,83 @@ pub struct BatchCapabilities {
 }
 
 impl BatchCapabilities {
+    /// Return empty capabilities (all batching and offloading disabled).
+    pub const fn unsupported() -> Self {
+        Self {
+            has_recvmmsg: false,
+            has_sendmmsg: false,
+            has_gro: false,
+            has_gso: false,
+        }
+    }
+
     /// Probe capabilities on a socket file descriptor.
+    #[cfg(target_os = "linux")]
     pub fn probe(fd: RawFd) -> Self {
         let disable_batch = std::env::var("WDTT_DISABLE_BATCH").is_ok();
         let disable_gro = std::env::var("WDTT_DISABLE_GRO").is_ok();
         let disable_gso = std::env::var("WDTT_DISABLE_GSO").is_ok();
 
-        #[cfg(target_os = "linux")]
-        {
-            let has_recvmmsg = !disable_batch;
-            let has_sendmmsg = !disable_batch;
+        let has_recvmmsg = !disable_batch;
+        let has_sendmmsg = !disable_batch;
 
-            // Probe GRO support
-            let mut has_gro = false;
-            if !disable_gro {
-                let optval: libc::c_int = 1;
-                // SAFETY: fd is valid and optval is a valid pointer to c_int of appropriate size.
-                let ret = unsafe {
-                    libc::setsockopt(
-                        fd,
-                        libc::SOL_UDP,
-                        libc::UDP_GRO,
-                        &optval as *const _ as *const libc::c_void,
-                        std::mem::size_of_val(&optval) as libc::socklen_t,
-                    )
-                };
-                if ret == 0 {
-                    has_gro = true;
-                    tracing::debug!(fd, "UDP GRO enabled successfully on socket");
-                } else {
-                    tracing::debug!(
-                        fd,
-                        errno = io::Error::last_os_error().raw_os_error(),
-                        "UDP GRO not supported by kernel/driver"
-                    );
-                }
-            }
-
-            // Probe GSO support
-            let mut has_gso = false;
-            if !disable_gso {
-                let optval: libc::c_int = 1500;
-                // SAFETY: fd is valid and optval is a valid pointer to c_int of appropriate size.
-                let ret = unsafe {
-                    libc::setsockopt(
-                        fd,
-                        libc::SOL_UDP,
-                        libc::UDP_SEGMENT,
-                        &optval as *const _ as *const libc::c_void,
-                        std::mem::size_of_val(&optval) as libc::socklen_t,
-                    )
-                };
-                if ret == 0 {
-                    has_gso = true;
-                    tracing::debug!(fd, "UDP GSO supported on socket");
-                } else {
-                    tracing::debug!(
-                        fd,
-                        errno = io::Error::last_os_error().raw_os_error(),
-                        "UDP GSO not supported by kernel/driver"
-                    );
-                }
-            }
-
-            Self {
-                has_recvmmsg,
-                has_sendmmsg,
-                has_gro,
-                has_gso,
+        // Probe GRO support
+        let mut has_gro = false;
+        if !disable_gro {
+            let optval: libc::c_int = 1;
+            // SAFETY: fd is valid and optval is a valid pointer to c_int of appropriate size.
+            let ret = unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_UDP,
+                    libc::UDP_GRO,
+                    &optval as *const _ as *const libc::c_void,
+                    std::mem::size_of_val(&optval) as libc::socklen_t,
+                )
+            };
+            if ret == 0 {
+                has_gro = true;
+                tracing::debug!(fd, "UDP GRO enabled successfully on socket");
+            } else {
+                tracing::debug!(
+                    fd,
+                    errno = io::Error::last_os_error().raw_os_error(),
+                    "UDP GRO not supported by kernel/driver"
+                );
             }
         }
 
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = (fd, disable_batch, disable_gro, disable_gso);
-            Self {
-                has_recvmmsg: false,
-                has_sendmmsg: false,
-                has_gro: false,
-                has_gso: false,
+        // Probe GSO support
+        let mut has_gso = false;
+        if !disable_gso {
+            let optval: libc::c_int = 1500;
+            // SAFETY: fd is valid and optval is a valid pointer to c_int of appropriate size.
+            let ret = unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_UDP,
+                    libc::UDP_SEGMENT,
+                    &optval as *const _ as *const libc::c_void,
+                    std::mem::size_of_val(&optval) as libc::socklen_t,
+                )
+            };
+            if ret == 0 {
+                has_gso = true;
+                tracing::debug!(fd, "UDP GSO supported on socket");
+            } else {
+                tracing::debug!(
+                    fd,
+                    errno = io::Error::last_os_error().raw_os_error(),
+                    "UDP GSO not supported by kernel/driver"
+                );
             }
+        }
+
+        Self {
+            has_recvmmsg,
+            has_sendmmsg,
+            has_gro,
+            has_gso,
         }
     }
 }
@@ -159,9 +157,20 @@ pub struct BatchedUdpSocket {
 impl BatchedUdpSocket {
     /// Create a new batched adapter for a Tokio UdpSocket.
     pub fn new(socket: Arc<UdpSocket>) -> Self {
-        let fd = socket.as_raw_fd();
-        let caps = BatchCapabilities::probe(fd);
+        #[cfg(target_os = "linux")]
+        let caps = BatchCapabilities::probe(socket.as_raw_fd());
+        #[cfg(not(target_os = "linux"))]
+        let caps = BatchCapabilities::unsupported();
+
         Self { socket, caps }
+    }
+
+    /// Create a batched adapter explicitly operating in single-packet fallback mode.
+    pub fn new_fallback(socket: Arc<UdpSocket>) -> Self {
+        Self {
+            socket,
+            caps: BatchCapabilities::unsupported(),
+        }
     }
 
     /// Access the underlying Tokio UdpSocket.
@@ -252,7 +261,7 @@ impl BatchedUdpSocket {
 
                     if self.caps.has_gro {
                         msghdr.msg_control = ctrl_bufs[i].as_mut_ptr() as *mut libc::c_void;
-                        msghdr.msg_controllen = ctrl_bufs[i].len();
+                        msghdr.msg_controllen = ctrl_bufs[i].len() as _;
                     }
 
                     hdrs.push(libc::mmsghdr {
@@ -270,7 +279,7 @@ impl BatchedUdpSocket {
                         fd,
                         hdrs.as_mut_ptr(),
                         batch_size as libc::c_uint,
-                        libc::MSG_DONTWAIT,
+                        libc::MSG_DONTWAIT as _,
                         std::ptr::null_mut(),
                     )
                 };
@@ -356,7 +365,7 @@ impl BatchedUdpSocket {
                         // SAFETY: std::mem::size_of::<u16>() is 2, fits within 64 byte ctrl_buf.
                         msghdr.msg_controllen =
                             unsafe { libc::CMSG_SPACE(std::mem::size_of::<u16>() as libc::c_uint) }
-                                as usize;
+                                as _;
 
                         // SAFETY: msghdr has valid msg_control buffer of sufficient length.
                         let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msghdr) };
@@ -365,8 +374,7 @@ impl BatchedUdpSocket {
                                 (*cmsg).cmsg_level = libc::SOL_UDP;
                                 (*cmsg).cmsg_type = libc::UDP_SEGMENT;
                                 (*cmsg).cmsg_len =
-                                    libc::CMSG_LEN(std::mem::size_of::<u16>() as libc::c_uint)
-                                        as usize;
+                                    libc::CMSG_LEN(std::mem::size_of::<u16>() as libc::c_uint) as _;
                                 let data_ptr = libc::CMSG_DATA(cmsg) as *mut u16;
                                 *data_ptr = seg_size;
                             }
@@ -386,7 +394,7 @@ impl BatchedUdpSocket {
                         fd,
                         hdrs.as_mut_ptr(),
                         batch_size as libc::c_uint,
-                        libc::MSG_DONTWAIT,
+                        libc::MSG_DONTWAIT as _,
                     )
                 };
 
@@ -601,5 +609,35 @@ mod tests {
         let mut metas = vec![RecvMeta::default(), RecvMeta::default()];
         let read = b_srv.recv_batch(&mut bufs, &mut metas).await.unwrap();
         assert!(read >= 1);
+    }
+
+    #[tokio::test]
+    async fn test_explicit_fallback_mode() {
+        let srv = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let srv_addr = srv.local_addr().unwrap();
+        let cln = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+
+        // Create explicit fallback sockets (forcing single-packet path)
+        let b_srv = BatchedUdpSocket::new_fallback(srv);
+        let b_cln = BatchedUdpSocket::new_fallback(cln);
+
+        assert_eq!(b_srv.capabilities(), BatchCapabilities::unsupported());
+        assert_eq!(b_cln.capabilities(), BatchCapabilities::unsupported());
+
+        let payload = b"fallback-verified-packet";
+        let pkts = [TransmitPacket {
+            buf: payload,
+            addr: srv_addr,
+            gso_segment_size: None,
+        }];
+
+        let sent = b_cln.send_batch(&pkts).await.unwrap();
+        assert_eq!(sent, 1);
+
+        let mut bufs = vec![vec![0u8; 128]];
+        let mut metas = vec![RecvMeta::default()];
+        let read = b_srv.recv_batch(&mut bufs, &mut metas).await.unwrap();
+        assert_eq!(read, 1);
+        assert_eq!(&bufs[0][..metas[0].len], payload);
     }
 }

@@ -1332,7 +1332,6 @@ dependencies = [
  "tracing",
  "wdtt-crypto",
  "wdtt-proto",
- "wdtt-provider",
  "wdtt-turn",
 ]
 
@@ -1431,8 +1430,6 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "thiserror",
- "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -1449,8 +1446,6 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
- "wdtt-crypto",
- "wdtt-proto",
 ]
 
 [[package]]

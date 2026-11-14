@@ -21,7 +21,6 @@ edition = "2024"
 license = "GPL-3.0-only"
 authors = ["The WDTT Authors"]
 repository = "https://github.com/wdtt-rs/wdtt"
-readme = "README.md"
 
 [workspace.dependencies]
 # Core utilities

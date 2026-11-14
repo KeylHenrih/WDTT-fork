@@ -262,7 +262,7 @@ impl TunnelClient {
                     }
                 }
 
-                _ = tick_timer.tick() => {
+                _ = tick_timer.tick(), if !resequencer.is_empty() => {
                     let mut timed_out = Vec::new();
                     resequencer.tick(Instant::now(), &mut timed_out);
                     if let Some(target) = wg_peer_addr {
