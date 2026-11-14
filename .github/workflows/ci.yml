@@ -17,11 +17,11 @@ jobs:
     name: Code Formatting and Linter
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@82a92a6e8fbeee08c636ad5c42577177d45f76e8 # v2.7.7
+      - uses: Swatinem/rust-cache@v2
       - name: Check Formatting
         run: cargo fmt --all -- --check
       - name: Run Clippy
@@ -31,8 +31,8 @@ jobs:
     name: License & Advisory Audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - uses: EmbarkStudios/cargo-deny-action@8371184b9963116d0377a49c600f0f465735dd63 # v2.0.12
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check
 
@@ -40,10 +40,10 @@ jobs:
     name: Secret Leak Detection (gitleaks)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: gitleaks/gitleaks-action@785d03a110bf02e77b629b35bc5d36e2f49bcf23 # v2.3.9
+      - uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -51,9 +51,9 @@ jobs:
     name: Unit & Integration Tests (Linux)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@82a92a6e8fbeee08c636ad5c42577177d45f76e8 # v2.7.7
+      - uses: Swatinem/rust-cache@v2
       - name: Run Workspace Tests
         run: cargo test --workspace --verbose
 
@@ -76,11 +76,11 @@ jobs:
             target: aarch64-apple-darwin
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@82a92a6e8fbeee08c636ad5c42577177d45f76e8 # v2.7.7
+      - uses: Swatinem/rust-cache@v2
       - name: Cargo Check Target
         run: cargo check --workspace --target ${{ matrix.target }}
 
@@ -89,13 +89,13 @@ jobs:
     needs: [fmt-and-clippy]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-musl
       - name: Install musl-tools
         run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - uses: Swatinem/rust-cache@82a92a6e8fbeee08c636ad5c42577177d45f76e8 # v2.7.7
+      - uses: Swatinem/rust-cache@v2
       - name: Build Server Static Binary
         run: cargo build --package wdtt-server --release --target x86_64-unknown-linux-musl
 
@@ -104,16 +104,16 @@ jobs:
     needs: [fmt-and-clippy]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android
-      - uses: nttld/setup-ndk@afbf51050e160419316447be4c2813589b276707 # v1.5.0
+      - uses: nttld/setup-ndk@v1
         id: setup-ndk
         with:
           ndk-version: r26d
           add-to-path: true
-      - uses: Swatinem/rust-cache@82a92a6e8fbeee08c636ad5c42577177d45f76e8 # v2.7.7
+      - uses: Swatinem/rust-cache@v2
       - name: Install cargo-ndk
         run: cargo install cargo-ndk --locked
       - name: Build Android cdylib
@@ -124,9 +124,9 @@ jobs:
     needs: [fmt-and-clippy]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
-      - uses: Swatinem/rust-cache@82a92a6e8fbeee08c636ad5c42577177d45f76e8 # v2.7.7
+      - uses: Swatinem/rust-cache@v2
       - name: Install cargo-fuzz prebuilt binary
         run: |
           mkdir -p ~/.cargo/bin
