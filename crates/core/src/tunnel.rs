@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+use crate::batch::{BatchedUdpSocket, RecvMeta};
 use crate::metrics::TunnelMetrics;
 use bytes::BytesMut;
 use rand::RngCore;
@@ -25,6 +26,27 @@ const MAX_PACKET_LEN: usize = 2048;
 const DEFAULT_SESSION_TTL: Duration = Duration::from_secs(300);
 
 /// Helper to create and bind non-blocking UDP socket with 4 MB send/recv buffers.
+fn tune_socket_buffers(sock: &socket2::Socket) {
+    if std::env::var("WDTT_DISABLE_SOCK_TUNE").is_ok() {
+        return;
+    }
+    let default_size = 4 * 1024 * 1024;
+    let rcv_size = match std::env::var("WDTT_SOCK_RCVBUF") {
+        Ok(v) => v.parse::<usize>().unwrap_or(0),
+        Err(_) => default_size,
+    };
+    if rcv_size > 0 {
+        let _ = sock.set_recv_buffer_size(rcv_size);
+    }
+    let snd_size = match std::env::var("WDTT_SOCK_SNDBUF") {
+        Ok(v) => v.parse::<usize>().unwrap_or(0),
+        Err(_) => default_size,
+    };
+    if snd_size > 0 {
+        let _ = sock.set_send_buffer_size(snd_size);
+    }
+}
+
 fn bind_tuned_udp_socket(addr: SocketAddr) -> Result<UdpSocket, std::io::Error> {
     let domain = match addr {
         SocketAddr::V4(_) => socket2::Domain::IPV4,
@@ -32,10 +54,7 @@ fn bind_tuned_udp_socket(addr: SocketAddr) -> Result<UdpSocket, std::io::Error> 
     };
     let sock2 = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
     sock2.set_nonblocking(true)?;
-    if std::env::var("WDTT_DISABLE_SOCK_TUNE").is_err() {
-        let _ = sock2.set_recv_buffer_size(4 * 1024 * 1024);
-        let _ = sock2.set_send_buffer_size(4 * 1024 * 1024);
-    }
+    tune_socket_buffers(&sock2);
     if let Ok(actual_rcv) = sock2.recv_buffer_size() {
         tracing::debug!(endpoint = %addr, actual_rcv_buf = actual_rcv, "Bound UDP socket");
     }
@@ -161,7 +180,7 @@ impl TunnelClient {
             self.config.server_relayed_addr, self.config.turn_server_addr
         );
 
-        let wg_socket = bind_tuned_udp_socket(self.config.wg_listen_addr)?;
+        let wg_socket = Arc::new(bind_tuned_udp_socket(self.config.wg_listen_addr)?);
         info!("WireGuard bridge listening on {}", wg_socket.local_addr()?);
 
         let turn_cfg = TurnClientConfig {
@@ -217,12 +236,21 @@ impl TunnelClient {
         turn_client.send_channel_data(&knock_frame).await?;
         debug!("Pre-Auth knock sent to server");
 
+        let batched_wg = BatchedUdpSocket::new(wg_socket.clone());
+        let batched_turn = BatchedUdpSocket::new(turn_client.socket().clone());
+
         let mut resequencer = WgResequencer::new(4096, Duration::from_millis(15));
         let mut wg_peer_addr: Option<SocketAddr> = None;
         let mut seq_tx: u16 = 0;
 
-        let mut wg_buf = vec![0u8; MAX_PACKET_LEN];
-        let mut turn_buf = vec![0u8; MAX_PACKET_LEN];
+        const BATCH_SIZE: usize = 16;
+        let mut wg_batch_bufs: Vec<Vec<u8>> =
+            (0..BATCH_SIZE).map(|_| vec![0u8; MAX_PACKET_LEN]).collect();
+        let mut wg_batch_metas: Vec<RecvMeta> = vec![RecvMeta::default(); BATCH_SIZE];
+
+        let mut turn_batch_bufs: Vec<Vec<u8>> =
+            (0..BATCH_SIZE).map(|_| vec![0u8; MAX_PACKET_LEN]).collect();
+        let mut turn_batch_metas: Vec<RecvMeta> = vec![RecvMeta::default(); BATCH_SIZE];
         let mut tick_timer = interval(RESEQUENCER_TICK_INTERVAL);
 
         loop {
@@ -266,21 +294,24 @@ impl TunnelClient {
                     }
                 }
 
-                // Packets from local WireGuard interface -> send over TURN
-                res = wg_socket.recv_from(&mut wg_buf) => {
-                    match res {
-                        Ok((len, src)) => {
-                            wg_peer_addr = Some(src);
-                            let payload = &wg_buf[..len];
+                // Packets from local WireGuard interface -> send over TURN (batched via recvmmsg)
+                read_res = batched_wg.recv_batch(&mut wg_batch_bufs, &mut wg_batch_metas) => {
+                    match read_res {
+                        Ok(count) => {
+                            for i in 0..count {
+                                let meta = wg_batch_metas[i];
+                                wg_peer_addr = Some(meta.addr);
+                                let payload = &wg_batch_bufs[i][..meta.len];
 
-                            let mut frame = BytesMut::new();
-                            encode_frame(FrameType::Data, 0, 0, seq_tx, payload, &mut frame);
-                            seq_tx = seq_tx.wrapping_add(1);
+                                let mut frame = BytesMut::new();
+                                encode_frame(FrameType::Data, 0, 0, seq_tx, payload, &mut frame);
+                                seq_tx = seq_tx.wrapping_add(1);
 
-                            if let Err(e) = turn_client.send_channel_data(&frame).await {
-                                warn!("Failed to forward WG packet to TURN: {e}");
-                            } else {
-                                self.metrics.record_tx(len);
+                                if let Err(e) = turn_client.send_channel_data(&frame).await {
+                                    warn!("Failed to forward WG packet to TURN: {e}");
+                                } else {
+                                    self.metrics.record_tx(meta.len);
+                                }
                             }
                         }
                         Err(e) => {
@@ -289,50 +320,56 @@ impl TunnelClient {
                     }
                 }
 
-                // Packets from TURN relay -> forward to local WireGuard
-                incoming_res = turn_client.recv_incoming(&mut turn_buf) => {
-                    match incoming_res {
-                        Ok(Some(TurnIncoming::ChannelData { payload, .. })) => {
-                            if let Ok((view, _)) = FrameView::decode(&payload) {
-                                match view.header.frame_type {
-                                    FrameType::Data => {
-                                        let data_payload = view.payload;
-                                        self.metrics.record_rx(data_payload.len());
+                // Packets from TURN relay -> forward to local WireGuard (batched via recvmmsg)
+                turn_batch_res = batched_turn.recv_batch(&mut turn_batch_bufs, &mut turn_batch_metas) => {
+                    match turn_batch_res {
+                        Ok(count) => {
+                            for i in 0..count {
+                                let meta = turn_batch_metas[i];
+                                let slice = &turn_batch_bufs[i][..meta.len];
+                                if let Ok(Some(TurnIncoming::ChannelData { payload, .. })) =
+                                    turn_client.parse_incoming(slice, meta.addr)
+                                    && let Ok((view, _)) = FrameView::decode(&payload)
+                                {
+                                        match view.header.frame_type {
+                                            FrameType::Data => {
+                                                let data_payload = view.payload;
+                                                self.metrics.record_rx(data_payload.len());
 
-                                        if let Some(target) = wg_peer_addr {
-                                            if let Ok(wg_hdr) = inspect_wg_packet(data_payload) {
-                                                if wg_hdr.is_data()
-                                                    && let (Some(rcv_idx), Some(counter)) =
-                                                        (wg_hdr.receiver_index, wg_hdr.counter)
-                                                {
-                                                    let mut ordered = Vec::new();
-                                                    resequencer.push(
-                                                        rcv_idx,
-                                                        counter,
-                                                        bytes::Bytes::copy_from_slice(data_payload),
-                                                        Instant::now(),
-                                                        &mut ordered,
-                                                    );
-                                                    for pkt in ordered {
-                                                        let _ = wg_socket.send_to(&pkt, target).await;
+                                                if let Some(target) = wg_peer_addr {
+                                                    if let Ok(wg_hdr) = inspect_wg_packet(data_payload) {
+                                                        if wg_hdr.is_data()
+                                                            && let (Some(rcv_idx), Some(counter)) =
+                                                                (wg_hdr.receiver_index, wg_hdr.counter)
+                                                        {
+                                                            let mut ordered = Vec::new();
+                                                            resequencer.push(
+                                                                rcv_idx,
+                                                                counter,
+                                                                bytes::Bytes::copy_from_slice(data_payload),
+                                                                Instant::now(),
+                                                                &mut ordered,
+                                                            );
+                                                            for pkt in ordered {
+                                                                let _ = wg_socket.send_to(&pkt, target).await;
+                                                            }
+                                                        } else {
+                                                            // WireGuard handshake bypass
+                                                            let _ = wg_socket.send_to(data_payload, target).await;
+                                                        }
+                                                    } else {
+                                                        let _ = wg_socket.send_to(data_payload, target).await;
                                                     }
-                                                } else {
-                                                    // WireGuard handshake bypass
-                                                    let _ = wg_socket.send_to(data_payload, target).await;
                                                 }
-                                            } else {
-                                                let _ = wg_socket.send_to(data_payload, target).await;
                                             }
+                                            FrameType::HandshakeResp => {
+                                                info!("Received HandshakeResp from tunnel server");
+                                            }
+                                            _ => {}
                                         }
                                     }
-                                    FrameType::HandshakeResp => {
-                                        info!("Received HandshakeResp from tunnel server");
-                                    }
-                                    _ => {}
                                 }
                             }
-                        }
-                        Ok(_) => {}
                         Err(e) => {
                             trace!("TURN recv incoming notice: {e}");
                         }
@@ -388,7 +425,7 @@ impl TunnelServer {
             self.config.turn_server_addr, self.config.wg_endpoint_addr
         );
 
-        let wg_socket = bind_tuned_udp_socket("0.0.0.0:0".parse().unwrap())?;
+        let wg_socket = Arc::new(bind_tuned_udp_socket("0.0.0.0:0".parse().unwrap())?);
         info!("Server WG forwarder bound to {}", wg_socket.local_addr()?);
 
         let turn_cfg = TurnClientConfig {
@@ -420,14 +457,23 @@ impl TunnelServer {
         let mut perm_refresh_timer = interval(turn_client.permission_refresh_interval());
         let mut chan_bind_refresh_timer = interval(turn_client.channel_bind_refresh_interval());
 
+        let batched_wg = BatchedUdpSocket::new(wg_socket.clone());
+        let batched_turn = BatchedUdpSocket::new(turn_client.socket().clone());
+
         let knock_key = derive_pre_auth_knock_key(&Psk::from_bytes(self.config.psk));
         let mut auth = KnockAuthenticator::new(knock_key, DEFAULT_MAX_CLOCK_SKEW_SEC);
 
         let mut active_session: Option<AuthorizedClientSession> = None;
         let mut seq_tx: u16 = 0;
 
-        let mut wg_buf = vec![0u8; MAX_PACKET_LEN];
-        let mut turn_buf = vec![0u8; MAX_PACKET_LEN];
+        const BATCH_SIZE: usize = 16;
+        let mut wg_batch_bufs: Vec<Vec<u8>> =
+            (0..BATCH_SIZE).map(|_| vec![0u8; MAX_PACKET_LEN]).collect();
+        let mut wg_batch_metas: Vec<RecvMeta> = vec![RecvMeta::default(); BATCH_SIZE];
+
+        let mut turn_batch_bufs: Vec<Vec<u8>> =
+            (0..BATCH_SIZE).map(|_| vec![0u8; MAX_PACKET_LEN]).collect();
+        let mut turn_batch_metas: Vec<RecvMeta> = vec![RecvMeta::default(); BATCH_SIZE];
 
         loop {
             tokio::select! {
@@ -464,139 +510,144 @@ impl TunnelServer {
                     }
                 }
 
-                // Packets from TURN relay -> validate knock or forward to WireGuard
-                incoming_res = turn_client.recv_incoming(&mut turn_buf) => {
-                    match incoming_res {
-                        Ok(Some(turn_msg)) => {
-                            let (peer_from_turn, payload) = match turn_msg {
-                                TurnIncoming::DataIndication { peer_addr, payload } => (Some(peer_addr), payload),
-                                TurnIncoming::ChannelData { payload, .. } => (
-                                    active_session.as_ref().map(|s| s.relayed_addr),
-                                    payload,
-                                ),
-                                _ => (None, bytes::Bytes::new()),
-                            };
+                // Packets from TURN relay -> validate knock or forward to WireGuard (batched)
+                turn_batch_res = batched_turn.recv_batch(&mut turn_batch_bufs, &mut turn_batch_metas) => {
+                    match turn_batch_res {
+                        Ok(count) => {
+                            for i in 0..count {
+                                let meta = turn_batch_metas[i];
+                                let slice = &turn_batch_bufs[i][..meta.len];
+                                if let Ok(Some(turn_msg)) = turn_client.parse_incoming(slice, meta.addr) {
+                                    let (peer_from_turn, payload) = match turn_msg {
+                                        TurnIncoming::DataIndication { peer_addr, payload } => (Some(peer_addr), payload),
+                                        TurnIncoming::ChannelData { payload, .. } => (
+                                            active_session.as_ref().map(|s| s.relayed_addr),
+                                            payload,
+                                        ),
+                                        _ => (None, bytes::Bytes::new()),
+                                    };
 
-                            if payload.is_empty() {
-                                continue;
-                            }
+                                    if payload.is_empty() {
+                                        continue;
+                                    }
 
-                            let now = Instant::now();
+                                    let now = Instant::now();
 
-                            // 1. Session expiration check
-                            if let Some(ref session) = active_session
-                                && session.is_expired(now)
-                            {
-                                info!(
-                                    "Client session {} expired due to inactivity (TTL {:?})",
-                                    session.relayed_addr, session.session_ttl
-                                );
-                                active_session = None;
-                            }
+                                    // 1. Session expiration check
+                                    if let Some(ref session) = active_session
+                                        && session.is_expired(now)
+                                    {
+                                        info!(
+                                            "Client session {} expired due to inactivity (TTL {:?})",
+                                            session.relayed_addr, session.session_ttl
+                                        );
+                                        active_session = None;
+                                    }
 
-                            // 2. Check for Pre-Auth Knock (HandshakeInit) - works for initial auth AND port reuse/reconnect!
-                            if let Ok((view, _)) = FrameView::decode(&payload)
-                                && view.header.frame_type == FrameType::HandshakeInit
-                            {
-                                let now_sec = SystemTime::now()
-                                    .duration_since(UNIX_EPOCH)
-                                    .unwrap()
-                                    .as_secs();
+                                    // 2. Check for Pre-Auth Knock (HandshakeInit)
+                                    if let Ok((view, _)) = FrameView::decode(&payload)
+                                        && view.header.frame_type == FrameType::HandshakeInit
+                                    {
+                                        let now_sec = SystemTime::now()
+                                            .duration_since(UNIX_EPOCH)
+                                            .unwrap()
+                                            .as_secs();
 
-                                match auth.verify_knock_packet(now_sec, view.payload) {
-                                    Ok(knock_payload) => {
-                                        let client_peer = peer_from_turn
-                                            .or_else(|| active_session.as_ref().map(|s| s.relayed_addr));
+                                        match auth.verify_knock_packet(now_sec, view.payload) {
+                                            Ok(knock_payload) => {
+                                                let client_peer = peer_from_turn
+                                                    .or_else(|| active_session.as_ref().map(|s| s.relayed_addr));
 
-                                        if let Some(peer) = client_peer {
-                                            info!(
-                                                "Pre-Auth Knock verified for peer {} (session {:?})!",
-                                                peer, knock_payload.session_id
-                                            );
+                                                if let Some(peer) = client_peer {
+                                                    info!(
+                                                        "Pre-Auth Knock verified for peer {} (session {:?})!",
+                                                        peer, knock_payload.session_id
+                                                    );
 
-                                            // Re-bind peer on TURN (handles port migration or fresh binding)
-                                            if let Err(e) = turn_client.bind_peer(peer).await {
-                                                warn!("Failed to bind peer {peer} on TURN: {e}");
+                                                    // Re-bind peer on TURN
+                                                    if let Err(e) = turn_client.bind_peer(peer).await {
+                                                        warn!("Failed to bind peer {peer} on TURN: {e}");
+                                                    }
+
+                                                    active_session = Some(AuthorizedClientSession {
+                                                        relayed_addr: peer,
+                                                        session_id: knock_payload.session_id,
+                                                        authorized_at: now,
+                                                        last_activity: now,
+                                                        session_ttl: DEFAULT_SESSION_TTL,
+                                                    });
+
+                                                    // Send HandshakeResp
+                                                    let mut resp_frame = BytesMut::new();
+                                                    encode_frame(
+                                                        FrameType::HandshakeResp,
+                                                        0,
+                                                        0,
+                                                        0,
+                                                        b"WDTT2-OK",
+                                                        &mut resp_frame,
+                                                    );
+                                                    let _ = turn_client.send_channel_data(&resp_frame).await;
+                                                } else {
+                                                    debug!("Knock verified but peer address unknown; silent discard");
+                                                }
                                             }
-
-                                            active_session = Some(AuthorizedClientSession {
-                                                relayed_addr: peer,
-                                                session_id: knock_payload.session_id,
-                                                authorized_at: now,
-                                                last_activity: now,
-                                                session_ttl: DEFAULT_SESSION_TTL,
-                                            });
-
-                                            // Send HandshakeResp
-                                            let mut resp_frame = BytesMut::new();
-                                            encode_frame(
-                                                FrameType::HandshakeResp,
-                                                0,
-                                                0,
-                                                0,
-                                                b"WDTT2-OK",
-                                                &mut resp_frame,
-                                            );
-                                            let _ = turn_client.send_channel_data(&resp_frame).await;
-                                        } else {
-                                            debug!("Knock verified but peer address unknown; silent discard");
+                                            Err(e) => {
+                                                debug!("Invalid knock rejected silently: {e}");
+                                            }
                                         }
+                                        continue;
                                     }
-                                    Err(e) => {
-                                        // SILENT DISCARD (zero bytes returned, no response)
-                                        debug!("Invalid knock rejected silently: {e}");
+
+                                    // 3. Authenticated Data forwarding
+                                    if let Some(ref mut session) = active_session {
+                                        if let Some(peer) = peer_from_turn
+                                            && peer != session.relayed_addr
+                                        {
+                                            debug!(
+                                                "Packet from unauthorized peer {peer} silently dropped; expected {}",
+                                                session.relayed_addr
+                                            );
+                                            continue;
+                                        }
+
+                                        if let Ok((view, _)) = FrameView::decode(&payload)
+                                            && view.header.frame_type == FrameType::Data
+                                        {
+                                            session.last_activity = now;
+                                            self.metrics.record_rx(view.payload.len());
+                                            let _ = wg_socket
+                                                .send_to(view.payload, self.config.wg_endpoint_addr)
+                                                .await;
+                                        }
+                                    } else {
+                                        debug!("Unauthenticated data packet dropped silently");
                                     }
                                 }
-                                continue;
-                            }
-
-                            // 3. Authenticated Data forwarding
-                            if let Some(ref mut session) = active_session {
-                                // Address & Port verification: drop packets spoofed from different peers
-                                if let Some(peer) = peer_from_turn
-                                    && peer != session.relayed_addr
-                                {
-                                    debug!(
-                                        "Packet from unauthorized peer {peer} silently dropped; expected {}",
-                                        session.relayed_addr
-                                    );
-                                    continue;
-                                }
-
-                                if let Ok((view, _)) = FrameView::decode(&payload)
-                                    && view.header.frame_type == FrameType::Data
-                                {
-                                    session.last_activity = now;
-                                    self.metrics.record_rx(view.payload.len());
-                                    let _ = wg_socket
-                                        .send_to(view.payload, self.config.wg_endpoint_addr)
-                                        .await;
-                                }
-                            } else {
-                                // SILENT DISCARD: non-handshake packet received without authenticated session
-                                debug!("Unauthenticated data packet dropped silently");
                             }
                         }
-                        Ok(None) => {}
                         Err(e) => {
-                            trace!("TURN incoming error: {e}");
+                            trace!("TURN incoming batch error: {e}");
                         }
                     }
                 }
 
-                // Packets from WireGuard endpoint -> send over TURN to client (only if authenticated)
-                res = wg_socket.recv_from(&mut wg_buf), if active_session.is_some() => {
-                    match res {
-                        Ok((len, _src)) => {
-                            let payload = &wg_buf[..len];
-                            let mut frame = BytesMut::new();
-                            encode_frame(FrameType::Data, 0, 0, seq_tx, payload, &mut frame);
-                            seq_tx = seq_tx.wrapping_add(1);
+                // Packets from WireGuard endpoint -> send over TURN to client (batched)
+                wg_batch_res = batched_wg.recv_batch(&mut wg_batch_bufs, &mut wg_batch_metas), if active_session.is_some() => {
+                    match wg_batch_res {
+                        Ok(count) => {
+                            for i in 0..count {
+                                let meta = wg_batch_metas[i];
+                                let payload = &wg_batch_bufs[i][..meta.len];
+                                let mut frame = BytesMut::new();
+                                encode_frame(FrameType::Data, 0, 0, seq_tx, payload, &mut frame);
+                                seq_tx = seq_tx.wrapping_add(1);
 
-                            if let Err(e) = turn_client.send_channel_data(&frame).await {
-                                warn!("Failed to forward server WG packet over TURN: {e}");
-                            } else {
-                                self.metrics.record_tx(len);
+                                if let Err(e) = turn_client.send_channel_data(&frame).await {
+                                    warn!("Failed to forward server WG packet over TURN: {e}");
+                                } else {
+                                    self.metrics.record_tx(meta.len);
+                                }
                             }
                         }
                         Err(e) => {

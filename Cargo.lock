@@ -1324,6 +1324,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bytes",
+ "libc",
  "rand 0.9.5",
  "socket2 0.5.10",
  "thiserror",

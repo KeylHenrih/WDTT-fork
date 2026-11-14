@@ -1,11 +1,15 @@
 //! Core tunnel engine, session state machine, and adaptive multi-stream dispatcher.
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 #![deny(missing_docs)]
 
+pub mod batch;
 pub mod metrics;
 pub mod tunnel;
 
+pub use batch::{
+    BatchCapabilities, BatchedUdpSocket, DEFAULT_BATCH_SIZE, RecvMeta, TransmitPacket,
+};
 pub use metrics::{MetricsSnapshot, TunnelMetrics};
 pub use tunnel::{TunnelClient, TunnelClientConfig, TunnelError, TunnelServer, TunnelServerConfig};
 

@@ -70,6 +70,27 @@ pub struct TurnClient {
     negotiated_lifetime_sec: u32,
 }
 
+fn tune_socket_buffers(sock: &socket2::Socket) {
+    if std::env::var("WDTT_DISABLE_SOCK_TUNE").is_ok() {
+        return;
+    }
+    let default_size = 4 * 1024 * 1024;
+    let rcv_size = match std::env::var("WDTT_SOCK_RCVBUF") {
+        Ok(v) => v.parse::<usize>().unwrap_or(0),
+        Err(_) => default_size,
+    };
+    if rcv_size > 0 {
+        let _ = sock.set_recv_buffer_size(rcv_size);
+    }
+    let snd_size = match std::env::var("WDTT_SOCK_SNDBUF") {
+        Ok(v) => v.parse::<usize>().unwrap_or(0),
+        Err(_) => default_size,
+    };
+    if snd_size > 0 {
+        let _ = sock.set_send_buffer_size(snd_size);
+    }
+}
+
 impl TurnClient {
     /// Create a new TURN client bound to an ephemeral local UDP port with tuned socket buffers.
     pub async fn bind(local_bind: SocketAddr, config: TurnClientConfig) -> Result<Self, TurnError> {
@@ -80,10 +101,7 @@ impl TurnClient {
         let sock2 =
             socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
         sock2.set_nonblocking(true)?;
-        if std::env::var("WDTT_DISABLE_SOCK_TUNE").is_err() {
-            let _ = sock2.set_recv_buffer_size(4 * 1024 * 1024);
-            let _ = sock2.set_send_buffer_size(4 * 1024 * 1024);
-        }
+        tune_socket_buffers(&sock2);
         sock2.bind(&local_bind.into())?;
         let std_socket: std::net::UdpSocket = sock2.into();
         let socket = UdpSocket::from_std(std_socket)?;
@@ -278,14 +296,21 @@ impl TurnClient {
         Ok(None)
     }
 
-    /// Receive an incoming packet from the TURN socket, parsing ChannelData or STUN DataIndication.
-    pub async fn recv_incoming(&self, buf: &mut [u8]) -> Result<Option<TurnIncoming>, TurnError> {
-        let (len, src) = self.socket.recv_from(buf).await?;
+    /// Reference to the underlying UDP socket.
+    pub fn socket(&self) -> &Arc<UdpSocket> {
+        &self.socket
+    }
+
+    /// Parse an incoming raw datagram received from `src` into a TurnIncoming message.
+    pub fn parse_incoming(
+        &self,
+        slice: &[u8],
+        src: SocketAddr,
+    ) -> Result<Option<TurnIncoming>, TurnError> {
         if src != self.config.server_addr {
             return Ok(None);
         }
 
-        let slice = &buf[..len];
         if is_channel_data(slice) {
             let (channel, payload, _) = decode_channel_data(slice)?;
             return Ok(Some(TurnIncoming::ChannelData { channel, payload }));
@@ -305,6 +330,12 @@ impl TurnClient {
         }
 
         Ok(None)
+    }
+
+    /// Receive an incoming packet from the TURN socket, parsing ChannelData or STUN DataIndication.
+    pub async fn recv_incoming(&self, buf: &mut [u8]) -> Result<Option<TurnIncoming>, TurnError> {
+        let (len, src) = self.socket.recv_from(buf).await?;
+        self.parse_incoming(&buf[..len], src)
     }
 
     async fn send_authenticated_allocate(&mut self) -> Result<StunMessage, TurnError> {

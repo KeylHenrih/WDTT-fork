@@ -1,0 +1,336 @@
+{
+  "summary": {
+    "baseline": {
+      "name": "Single-Packet Fallback (WDTT_DISABLE_BATCH=1)",
+      "throughput_mbps": {
+        "med": 1783.74,
+        "min": 1534.83,
+        "max": 1811.04
+      },
+      "retransmits": {
+        "med": 805,
+        "min": 93,
+        "max": 1016
+      },
+      "pps": {
+        "med": 185806,
+        "min": 159878,
+        "max": 188649
+      },
+      "server_cpu_pct": {
+        "med": 35.9,
+        "min": 35.0,
+        "max": 44.7
+      },
+      "server_usr_pct": {
+        "med": 3.5,
+        "min": 3.0,
+        "max": 5.7
+      },
+      "server_sys_pct": {
+        "med": 32.9,
+        "min": 31.4,
+        "max": 39.0
+      },
+      "client_cpu_pct": {
+        "med": 27.07,
+        "min": 26.8,
+        "max": 29.7
+      },
+      "coturn_cpu_pct": {
+        "med": 0.0,
+        "min": 0.0,
+        "max": 0.0
+      },
+      "srv_cpu_sec_per_gbit": {
+        "med": 0.21,
+        "min": 0.2,
+        "max": 0.25
+      },
+      "total_cpu_sec_per_gbit": {
+        "med": 0.36,
+        "min": 0.35,
+        "max": 0.42
+      }
+    },
+    "recvmmsg": {
+      "name": "recvmmsg / sendmmsg Batching",
+      "throughput_mbps": {
+        "med": 1764.81,
+        "min": 1453.37,
+        "max": 1796.91
+      },
+      "retransmits": {
+        "med": 379,
+        "min": 353,
+        "max": 470
+      },
+      "pps": {
+        "med": 183834,
+        "min": 151392,
+        "max": 187178
+      },
+      "server_cpu_pct": {
+        "med": 34.8,
+        "min": 33.8,
+        "max": 36.2
+      },
+      "server_usr_pct": {
+        "med": 2.9,
+        "min": 2.6,
+        "max": 3.0
+      },
+      "server_sys_pct": {
+        "med": 32.2,
+        "min": 31.2,
+        "max": 33.2
+      },
+      "client_cpu_pct": {
+        "med": 27.3,
+        "min": 26.6,
+        "max": 29.8
+      },
+      "coturn_cpu_pct": {
+        "med": 0.0,
+        "min": 0.0,
+        "max": 0.0
+      },
+      "srv_cpu_sec_per_gbit": {
+        "med": 0.2,
+        "min": 0.19,
+        "max": 0.23
+      },
+      "total_cpu_sec_per_gbit": {
+        "med": 0.36,
+        "min": 0.34,
+        "max": 0.42
+      }
+    }
+  },
+  "raw": {
+    "baseline": [
+      {
+        "throughput_mbps": 1783.74,
+        "retransmits": 93,
+        "pps": 185806,
+        "server_cpu": {
+          "usr": 5.7,
+          "sys": 39.0,
+          "cpu": 44.7
+        },
+        "client_cpu": {
+          "usr": 3.9,
+          "sys": 25.8,
+          "cpu": 29.7
+        },
+        "coturn_cpu": {
+          "usr": 0.0,
+          "sys": 0.0,
+          "cpu": 0.0
+        },
+        "srv_cpu_sec_per_gbit": 0.2506,
+        "total_cpu_sec_per_gbit": 0.4171
+      },
+      {
+        "throughput_mbps": 1769.11,
+        "retransmits": 837,
+        "pps": 184281,
+        "server_cpu": {
+          "usr": 3.6,
+          "sys": 31.4,
+          "cpu": 35.0
+        },
+        "client_cpu": {
+          "usr": 3.8,
+          "sys": 23.1,
+          "cpu": 26.9
+        },
+        "coturn_cpu": {
+          "usr": 0.0,
+          "sys": 0.0,
+          "cpu": 0.0
+        },
+        "srv_cpu_sec_per_gbit": 0.1978,
+        "total_cpu_sec_per_gbit": 0.3499
+      },
+      {
+        "throughput_mbps": 1534.83,
+        "retransmits": 1016,
+        "pps": 159878,
+        "server_cpu": {
+          "usr": 3.0,
+          "sys": 32.9,
+          "cpu": 35.9
+        },
+        "client_cpu": {
+          "usr": 3.4,
+          "sys": 23.9,
+          "cpu": 27.3
+        },
+        "coturn_cpu": {
+          "usr": 0.0,
+          "sys": 0.0,
+          "cpu": 0.0
+        },
+        "srv_cpu_sec_per_gbit": 0.2339,
+        "total_cpu_sec_per_gbit": 0.4118
+      },
+      {
+        "throughput_mbps": 1795.13,
+        "retransmits": 805,
+        "pps": 186993,
+        "server_cpu": {
+          "usr": 3.5,
+          "sys": 33.47,
+          "cpu": 36.96
+        },
+        "client_cpu": {
+          "usr": 3.7,
+          "sys": 23.38,
+          "cpu": 27.07
+        },
+        "coturn_cpu": {
+          "usr": 0.0,
+          "sys": 0.0,
+          "cpu": 0.0
+        },
+        "srv_cpu_sec_per_gbit": 0.2059,
+        "total_cpu_sec_per_gbit": 0.3567
+      },
+      {
+        "throughput_mbps": 1811.04,
+        "retransmits": 320,
+        "pps": 188649,
+        "server_cpu": {
+          "usr": 3.4,
+          "sys": 32.4,
+          "cpu": 35.8
+        },
+        "client_cpu": {
+          "usr": 3.5,
+          "sys": 23.3,
+          "cpu": 26.8
+        },
+        "coturn_cpu": {
+          "usr": 0.0,
+          "sys": 0.0,
+          "cpu": 0.0
+        },
+        "srv_cpu_sec_per_gbit": 0.1977,
+        "total_cpu_sec_per_gbit": 0.3457
+      }
+    ],
+    "recvmmsg": [
+      {
+        "throughput_mbps": 1791.92,
+        "retransmits": 378,
+        "pps": 186658,
+        "server_cpu": {
+          "usr": 3.0,
+          "sys": 31.57,
+          "cpu": 34.57
+        },
+        "client_cpu": {
+          "usr": 3.2,
+          "sys": 23.58,
+          "cpu": 26.77
+        },
+        "coturn_cpu": {
+          "usr": 0.0,
+          "sys": 0.0,
+          "cpu": 0.0
+        },
+        "srv_cpu_sec_per_gbit": 0.1929,
+        "total_cpu_sec_per_gbit": 0.3423
+      },
+      {
+        "throughput_mbps": 1749.12,
+        "retransmits": 470,
+        "pps": 182199,
+        "server_cpu": {
+          "usr": 2.6,
+          "sys": 32.2,
+          "cpu": 34.8
+        },
+        "client_cpu": {
+          "usr": 3.2,
+          "sys": 24.1,
+          "cpu": 27.3
+        },
+        "coturn_cpu": {
+          "usr": 0.0,
+          "sys": 0.0,
+          "cpu": 0.0
+        },
+        "srv_cpu_sec_per_gbit": 0.199,
+        "total_cpu_sec_per_gbit": 0.355
+      },
+      {
+        "throughput_mbps": 1453.37,
+        "retransmits": 468,
+        "pps": 151392,
+        "server_cpu": {
+          "usr": 2.6,
+          "sys": 31.2,
+          "cpu": 33.8
+        },
+        "client_cpu": {
+          "usr": 3.5,
+          "sys": 23.1,
+          "cpu": 26.6
+        },
+        "coturn_cpu": {
+          "usr": 0.0,
+          "sys": 0.0,
+          "cpu": 0.0
+        },
+        "srv_cpu_sec_per_gbit": 0.2326,
+        "total_cpu_sec_per_gbit": 0.4156
+      },
+      {
+        "throughput_mbps": 1796.91,
+        "retransmits": 379,
+        "pps": 187178,
+        "server_cpu": {
+          "usr": 2.9,
+          "sys": 32.9,
+          "cpu": 35.8
+        },
+        "client_cpu": {
+          "usr": 3.6,
+          "sys": 25.8,
+          "cpu": 29.4
+        },
+        "coturn_cpu": {
+          "usr": 0.0,
+          "sys": 0.0,
+          "cpu": 0.0
+        },
+        "srv_cpu_sec_per_gbit": 0.1992,
+        "total_cpu_sec_per_gbit": 0.3628
+      },
+      {
+        "throughput_mbps": 1764.81,
+        "retransmits": 353,
+        "pps": 183834,
+        "server_cpu": {
+          "usr": 3.0,
+          "sys": 33.2,
+          "cpu": 36.2
+        },
+        "client_cpu": {
+          "usr": 4.3,
+          "sys": 25.5,
+          "cpu": 29.8
+        },
+        "coturn_cpu": {
+          "usr": 0.0,
+          "sys": 0.0,
+          "cpu": 0.0
+        },
+        "srv_cpu_sec_per_gbit": 0.2051,
+        "total_cpu_sec_per_gbit": 0.374
+      }
+    ]
+  }
+}
