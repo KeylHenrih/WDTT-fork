@@ -1,0 +1,34 @@
+[workspace]
+members = ["."]
+
+[package]
+name = "wdtt-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+wdtt-proto = { path = "../crates/proto" }
+wdtt-turn = { path = "../crates/turn" }
+
+[[bin]]
+name = "fuzz_url"
+path = "fuzz_targets/fuzz_url.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_frame"
+path = "fuzz_targets/fuzz_frame.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_stun"
+path = "fuzz_targets/fuzz_stun.rs"
+test = false
+doc = false

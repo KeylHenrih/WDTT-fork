@@ -4,6 +4,13 @@ use std::fmt;
 use std::str::FromStr;
 use url::Url;
 
+/// Default number of concurrent TURN streams in pool.
+pub const DEFAULT_WORKERS: u8 = 4;
+
+/// Architectural upper bound estimate of concurrent TURN streams before STUN 486
+/// (ADR-0002 / ADR-0006 architectural estimate, pending cz-1 quota measurement).
+pub const MAX_WORKERS_ESTIMATE: u8 = 8;
+
 /// Tunnel transport mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -75,7 +82,10 @@ impl fmt::Display for SprayMode {
 }
 
 /// Normalized tunnel connection configuration.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Implements custom `Debug` and `Display` to guarantee passwords and hashes
+/// are NEVER printed to logs or standard outputs.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TunnelConfig {
     /// Optional human-readable connection name.
     pub name: Option<String>,
@@ -91,7 +101,7 @@ pub struct TunnelConfig {
     pub password: String,
     /// Pool of TURN allocation hashes (e.g. VK call hashes).
     pub hashes: Vec<String>,
-    /// Number of concurrent TURN streams in pool (default: 4, clamp: 1..=64).
+    /// Configured stream count requested in URL (default: `DEFAULT_WORKERS`).
     pub workers: u8,
     /// Transport mode (DTLS or Direct RTP).
     pub mode: TunnelMode,
@@ -99,6 +109,44 @@ pub struct TunnelConfig {
     pub reseq_window: u32,
     /// Multi-stream packet scheduler strategy.
     pub spray_mode: SprayMode,
+}
+
+impl fmt::Debug for TunnelConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TunnelConfig")
+            .field("name", &self.name)
+            .field("host", &self.host)
+            .field("dtls_port", &self.dtls_port)
+            .field("wg_port", &self.wg_port)
+            .field("local_port", &self.local_port)
+            .field("password", &"[REDACTED]")
+            .field(
+                "hashes",
+                &format!("[REDACTED; count={}]", self.hashes.len()),
+            )
+            .field("workers", &self.workers)
+            .field("mode", &self.mode)
+            .field("reseq_window", &self.reseq_window)
+            .field("spray_mode", &self.spray_mode)
+            .finish()
+    }
+}
+
+impl fmt::Display for TunnelConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "TunnelConfig(name={:?}, endpoint={}:{}, wg={}, local={}, mode={}, workers={}, spray={})",
+            self.name,
+            self.host,
+            self.dtls_port,
+            self.wg_port,
+            self.local_port,
+            self.mode,
+            self.workers,
+            self.spray_mode
+        )
+    }
 }
 
 impl Default for TunnelConfig {
@@ -111,7 +159,7 @@ impl Default for TunnelConfig {
             local_port: 0,
             password: String::new(),
             hashes: Vec::new(),
-            workers: 4,
+            workers: DEFAULT_WORKERS,
             mode: TunnelMode::Dtls,
             reseq_window: 4096,
             spray_mode: SprayMode::FlowHash,
@@ -120,6 +168,11 @@ impl Default for TunnelConfig {
 }
 
 impl TunnelConfig {
+    /// Calculate effective worker count clamped to an upper bound (e.g. `MAX_WORKERS_ESTIMATE`).
+    pub fn effective_workers(&self, max_allowed: u8) -> u8 {
+        self.workers.clamp(1, max_allowed)
+    }
+
     /// Parse any supported tunnel URL format:
     /// - `wdtt2://`
     /// - `qwdtt://config?...`
@@ -161,7 +214,7 @@ impl TunnelConfig {
         let mut local_port = 0u16;
         let mut password = String::new();
         let mut hashes = Vec::new();
-        let mut workers = 4u8;
+        let mut workers = DEFAULT_WORKERS;
         let mut mode = TunnelMode::Dtls;
         let mut reseq_window = 4096u32;
         let mut spray_mode = SprayMode::FlowHash;
@@ -189,13 +242,13 @@ impl TunnelConfig {
                         .collect();
                 }
                 "workers" | "n" => {
-                    let w = v
-                        .parse::<u32>()
-                        .map_err(|_| ProtoError::InvalidWorkerCount(0))?;
-                    if w == 0 || w > 64 {
-                        return Err(ProtoError::InvalidWorkerCount(w));
+                    if let Ok(w) = v.parse::<u32>() {
+                        workers = if w > 0 {
+                            w.min(255) as u8
+                        } else {
+                            DEFAULT_WORKERS
+                        };
                     }
-                    workers = w as u8;
                 }
                 "mode" => {
                     mode = TunnelMode::from_str(&v)?;
@@ -242,7 +295,7 @@ impl TunnelConfig {
         let mut local_port = 0u16;
         let mut password = String::new();
         let mut hashes = Vec::new();
-        let mut workers = 4u8;
+        let mut workers = DEFAULT_WORKERS;
 
         for (k, v) in parsed.query_pairs() {
             match k.as_ref() {
@@ -272,13 +325,13 @@ impl TunnelConfig {
                         .collect();
                 }
                 "workers" => {
-                    let w = v
-                        .parse::<u32>()
-                        .map_err(|_| ProtoError::InvalidWorkerCount(0))?;
-                    if w == 0 || w > 64 {
-                        return Err(ProtoError::InvalidWorkerCount(w));
+                    if let Ok(w) = v.parse::<u32>() {
+                        workers = if w > 0 {
+                            w.min(255) as u8
+                        } else {
+                            DEFAULT_WORKERS
+                        };
                     }
-                    workers = w as u8;
                 }
                 "port" | "local" => {
                     local_port = v
@@ -330,7 +383,7 @@ impl TunnelConfig {
         let mut local_port = 0u16;
         let mut password = String::new();
         let mut hashes = Vec::new();
-        let mut workers = 4u8;
+        let mut workers = DEFAULT_WORKERS;
 
         for (k, v) in parsed.query_pairs() {
             match k.as_ref() {
@@ -368,11 +421,12 @@ impl TunnelConfig {
                         .collect();
                 }
                 "workers" => {
-                    let w = v
-                        .parse::<u32>()
-                        .map_err(|_| ProtoError::InvalidWorkerCount(0))?;
-                    if w > 0 && w <= 64 {
-                        workers = w as u8;
+                    if let Ok(w) = v.parse::<u32>() {
+                        workers = if w > 0 {
+                            w.min(255) as u8
+                        } else {
+                            DEFAULT_WORKERS
+                        };
                     }
                 }
                 _ => {}
@@ -464,7 +518,7 @@ impl TunnelConfig {
             local_port,
             password,
             hashes,
-            workers: 4,
+            workers: DEFAULT_WORKERS,
             mode: TunnelMode::Dtls,
             reseq_window: 4096,
             spray_mode: SprayMode::FlowHash,
@@ -633,17 +687,47 @@ mod tests {
         assert!(TunnelConfig::parse("ftp://example.com").is_err());
         assert!(TunnelConfig::parse("wdtt://short").is_err());
         assert!(TunnelConfig::parse("wdtt://1.2.3.4:5555").is_err());
-        assert!(TunnelConfig::parse("qwdtt://config?workers=abc").is_err());
     }
 
     #[test]
-    fn test_worker_count_clamping_and_validation() {
-        assert!(TunnelConfig::parse("qwdtt://config?peer=1.2.3.4:5000&pass=p&workers=0").is_err());
-        assert!(
-            TunnelConfig::parse("qwdtt://config?peer=1.2.3.4:5000&pass=p&workers=999").is_err()
-        );
-        let valid =
+    fn test_debug_and_display_redact_secrets() {
+        let cfg = TunnelConfig {
+            name: Some("SecretTunnel".into()),
+            host: "192.168.1.1".into(),
+            dtls_port: 56000,
+            wg_port: 56001,
+            local_port: 9000,
+            password: "EXTREMELY_CONFIDENTIAL_PASSWORD".into(),
+            hashes: vec!["SECRET_VK_HASH_A".into(), "SECRET_VK_HASH_B".into()],
+            workers: 4,
+            mode: TunnelMode::Dtls,
+            reseq_window: 4096,
+            spray_mode: SprayMode::FlowHash,
+        };
+
+        let debug_str = format!("{cfg:?}");
+        assert!(!debug_str.contains("EXTREMELY_CONFIDENTIAL_PASSWORD"));
+        assert!(!debug_str.contains("SECRET_VK_HASH_A"));
+        assert!(!debug_str.contains("SECRET_VK_HASH_B"));
+        assert!(debug_str.contains("[REDACTED]"));
+
+        let display_str = format!("{cfg}");
+        assert!(!display_str.contains("EXTREMELY_CONFIDENTIAL_PASSWORD"));
+        assert!(!display_str.contains("SECRET_VK_HASH_A"));
+        assert!(!display_str.contains("SECRET_VK_HASH_B"));
+        assert!(display_str.contains("endpoint=192.168.1.1:56000"));
+    }
+
+    #[test]
+    fn test_workers_configuration_and_clamping() {
+        let cfg =
             TunnelConfig::parse("qwdtt://config?peer=1.2.3.4:5000&pass=p&workers=16").unwrap();
-        assert_eq!(valid.workers, 16);
+        assert_eq!(cfg.workers, 16);
+        // Clamped by ADR-0002/0006 estimate (8)
+        assert_eq!(cfg.effective_workers(MAX_WORKERS_ESTIMATE), 8);
+        assert_eq!(cfg.effective_workers(32), 16);
+
+        let cfg_default = TunnelConfig::parse("qwdtt://config?peer=1.2.3.4:5000&pass=p").unwrap();
+        assert_eq!(cfg_default.workers, DEFAULT_WORKERS);
     }
 }

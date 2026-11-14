@@ -13,4 +13,7 @@ pub use anti_replay::{AntiReplayWindow, REPLAY_WINDOW_SIZE, REPLAY_WINDOW_WORDS}
 pub use error::CryptoError;
 pub use kdf::derive_session_keys;
 pub use key::{AeadKey, KnockKey, Psk, SessionKeys};
-pub use knock::{DEFAULT_MAX_CLOCK_SKEW_SEC, KNOCK_TAG_LEN, KnockAuthenticator};
+pub use knock::{
+    DEFAULT_MAX_CLOCK_SKEW_SEC, KnockAuthenticator, KnockPayload, MAX_NONCE_CACHE_ENTRIES,
+    MIN_KNOCK_WIRE_LEN, NonceReplayCache,
+};

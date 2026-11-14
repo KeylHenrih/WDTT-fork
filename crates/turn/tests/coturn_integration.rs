@@ -34,7 +34,9 @@ async fn test_coturn_live_if_available() {
         return;
     }
 
-    eprintln!("Live coturn detected on 127.0.0.1:3478! Executing full allocation test...");
+    eprintln!(
+        "Live coturn detected on 127.0.0.1:3478! Executing full allocation and keepalive tests..."
+    );
     let config = TurnClientConfig {
         server_addr: coturn_addr,
         peer_addr: "10.0.0.2:51820".parse().unwrap(),
@@ -51,4 +53,24 @@ async fn test_coturn_live_if_available() {
     let relayed = client.allocate().await.expect("allocate on live coturn");
     eprintln!("Successfully allocated on live coturn: {relayed}");
     assert!(client.relayed_addr().is_some());
+
+    // Test refresh allocation on live coturn
+    let refreshed = client
+        .refresh_allocation(300)
+        .await
+        .expect("refresh on live coturn");
+    eprintln!("Refreshed lifetime on live coturn: {refreshed}s");
+    assert!(refreshed > 0);
+
+    // Test refresh permission on live coturn
+    client
+        .refresh_permission()
+        .await
+        .expect("refresh permission on live coturn");
+
+    // Test refresh channel bind on live coturn
+    client
+        .refresh_channel_bind()
+        .await
+        .expect("refresh channel bind on live coturn");
 }

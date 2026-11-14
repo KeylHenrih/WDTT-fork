@@ -17,5 +17,5 @@ pub use resequencer::{
     DEFAULT_GAP_TIMEOUT, DEFAULT_RESEQUENCER_CAPACITY, MAX_RECEIVER_STREAMS, ReceiverStreamState,
     ResequencerStats, WgResequencer,
 };
-pub use url::{SprayMode, TunnelConfig, TunnelMode};
+pub use url::{DEFAULT_WORKERS, MAX_WORKERS_ESTIMATE, SprayMode, TunnelConfig, TunnelMode};
 pub use wireguard::{WgHeaderView, WgPacketType, inspect_wg_packet};

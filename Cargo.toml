@@ -13,6 +13,7 @@ members = [
     "crates/gui-desktop",
     "crates/ffi-android",
 ]
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.1.0"

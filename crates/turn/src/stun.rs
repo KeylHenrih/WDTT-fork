@@ -40,6 +40,15 @@ pub const ATTR_XOR_PEER_ADDRESS: u16 = 0x0012;
 pub const ATTR_DATA: u16 = 0x0013;
 pub const ATTR_CHANNEL_NUMBER: u16 = 0x000C;
 
+// Standard STUN Error Codes (RFC 5389 / RFC 5766)
+pub const CODE_BAD_REQUEST: u16 = 400;
+pub const CODE_UNAUTHORIZED: u16 = 401;
+pub const CODE_FORBIDDEN: u16 = 403;
+pub const CODE_ALLOCATION_MISMATCH: u16 = 437;
+pub const CODE_STALE_NONCE: u16 = 438;
+pub const CODE_ALLOCATION_QUOTA_REACHED: u16 = 486;
+pub const CODE_SERVER_ERROR: u16 = 500;
+
 /// STUN Attribute representation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StunAttribute {

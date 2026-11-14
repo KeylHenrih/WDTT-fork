@@ -37,7 +37,7 @@ impl Default for TurnClientConfig {
     }
 }
 
-/// Asynchronous TURN Client.
+/// Asynchronous TURN Client with automatic 438 Stale Nonce recovery and keepalive lifecycle management.
 pub struct TurnClient {
     socket: Arc<UdpSocket>,
     config: TurnClientConfig,
@@ -68,6 +68,11 @@ impl TurnClient {
         self.relayed_addr
     }
 
+    /// Update target peer address before creating permissions or channel binding.
+    pub fn set_peer_addr(&mut self, peer_addr: SocketAddr) {
+        self.config.peer_addr = peer_addr;
+    }
+
     /// Perform full TURN allocation, permission grant, and channel binding.
     pub async fn allocate(&mut self) -> Result<SocketAddr, TurnError> {
         info!(
@@ -82,11 +87,11 @@ impl TurnClient {
         let initial_req = StunMessage::new(ALLOCATE_REQUEST, tx_id)
             .with_attribute(StunAttribute::RequestedTransport(17)); // UDP
 
-        let resp = self.send_stun_request(&initial_req, &tx_id, None).await?;
+        let resp = self.send_stun_packet(&initial_req, &tx_id, None).await?;
 
         // Expect 401 Unauthorized
         if let Some((code, _)) = resp.error_code()
-            && code != 401
+            && code != CODE_UNAUTHORIZED
         {
             return Err(TurnError::StunErrorResponse {
                 code,
@@ -106,25 +111,7 @@ impl TurnClient {
         self.key = compute_long_term_key(&self.config.username, &self.realm, &self.config.password);
 
         // 2. Authenticated Allocate
-        rand::rng().fill_bytes(&mut tx_id);
-        let auth_alloc = StunMessage::new(ALLOCATE_REQUEST, tx_id)
-            .with_attribute(StunAttribute::RequestedTransport(17))
-            .with_attribute(StunAttribute::Lifetime(self.config.lifetime_sec))
-            .with_attribute(StunAttribute::Username(self.config.username.clone()))
-            .with_attribute(StunAttribute::Realm(self.realm.clone()))
-            .with_attribute(StunAttribute::Nonce(self.nonce.clone()));
-
-        let alloc_resp = self
-            .send_stun_request(&auth_alloc, &tx_id, Some(&self.key))
-            .await?;
-
-        if let Some((code, reason)) = alloc_resp.error_code() {
-            return Err(TurnError::StunErrorResponse {
-                code,
-                reason: reason.to_string(),
-            });
-        }
-
+        let alloc_resp = self.send_authenticated_allocate().await?;
         let relayed_addr = alloc_resp
             .relayed_address()
             .ok_or(TurnError::MissingAttribute("XOR-RELAYED-ADDRESS"))?;
@@ -132,58 +119,17 @@ impl TurnClient {
         info!("TURN allocation granted: relayed addr = {relayed_addr}");
 
         // 3. Create Permission for peer
-        rand::rng().fill_bytes(&mut tx_id);
-        let perm_req = StunMessage::new(CREATE_PERMISSION_REQUEST, tx_id)
-            .with_attribute(StunAttribute::XorPeerAddress(self.config.peer_addr))
-            .with_attribute(StunAttribute::Username(self.config.username.clone()))
-            .with_attribute(StunAttribute::Realm(self.realm.clone()))
-            .with_attribute(StunAttribute::Nonce(self.nonce.clone()));
-
-        let perm_resp = self
-            .send_stun_request(&perm_req, &tx_id, Some(&self.key))
-            .await?;
-
-        if let Some((code, reason)) = perm_resp.error_code() {
-            return Err(TurnError::StunErrorResponse {
-                code,
-                reason: reason.to_string(),
-            });
-        }
-        debug!(
-            "TURN CreatePermission succeeded for {}",
-            self.config.peer_addr
-        );
+        self.create_permission_internal().await?;
 
         // 4. ChannelBind peer to channel number
-        rand::rng().fill_bytes(&mut tx_id);
-        let chan_req = StunMessage::new(CHANNEL_BIND_REQUEST, tx_id)
-            .with_attribute(StunAttribute::ChannelNumber(self.config.channel_number))
-            .with_attribute(StunAttribute::XorPeerAddress(self.config.peer_addr))
-            .with_attribute(StunAttribute::Username(self.config.username.clone()))
-            .with_attribute(StunAttribute::Realm(self.realm.clone()))
-            .with_attribute(StunAttribute::Nonce(self.nonce.clone()));
-
-        let chan_resp = self
-            .send_stun_request(&chan_req, &tx_id, Some(&self.key))
-            .await?;
-
-        if let Some((code, reason)) = chan_resp.error_code() {
-            return Err(TurnError::StunErrorResponse {
-                code,
-                reason: reason.to_string(),
-            });
-        }
-        info!(
-            "TURN ChannelBind succeeded: channel 0x{:04X} -> {}",
-            self.config.channel_number, self.config.peer_addr
-        );
+        self.channel_bind_internal().await?;
 
         self.allocated.store(true, Ordering::SeqCst);
         Ok(relayed_addr)
     }
 
-    /// Refresh allocation lifetime.
-    pub async fn refresh(&mut self, lifetime_sec: u32) -> Result<u32, TurnError> {
+    /// Refresh allocation lifetime (RFC 5766 Section 7).
+    pub async fn refresh_allocation(&mut self, lifetime_sec: u32) -> Result<u32, TurnError> {
         let mut tx_id = [0u8; 12];
         rand::rng().fill_bytes(&mut tx_id);
 
@@ -193,9 +139,7 @@ impl TurnClient {
             .with_attribute(StunAttribute::Realm(self.realm.clone()))
             .with_attribute(StunAttribute::Nonce(self.nonce.clone()));
 
-        let resp = self
-            .send_stun_request(&req, &tx_id, Some(&self.key))
-            .await?;
+        let resp = self.send_authenticated_request(req, &tx_id).await?;
         if let Some((code, reason)) = resp.error_code() {
             return Err(TurnError::StunErrorResponse {
                 code,
@@ -206,6 +150,16 @@ impl TurnClient {
         let granted = resp.lifetime().unwrap_or(lifetime_sec);
         debug!("TURN Refresh granted lifetime: {granted}s");
         Ok(granted)
+    }
+
+    /// Refresh permission for target peer before 300s expiration (RFC 5766 Section 8).
+    pub async fn refresh_permission(&mut self) -> Result<(), TurnError> {
+        self.create_permission_internal().await
+    }
+
+    /// Refresh channel binding before 10-minute expiration (RFC 5766 Section 11).
+    pub async fn refresh_channel_bind(&mut self) -> Result<(), TurnError> {
+        self.channel_bind_internal().await
     }
 
     /// Send a data packet encapsulated in a TURN ChannelData message to the relay.
@@ -236,8 +190,109 @@ impl TurnClient {
         Ok(None)
     }
 
-    /// Helper to send a STUN request and await matching response with timeout.
-    async fn send_stun_request(
+    async fn send_authenticated_allocate(&mut self) -> Result<StunMessage, TurnError> {
+        let mut tx_id = [0u8; 12];
+        rand::rng().fill_bytes(&mut tx_id);
+
+        let req = StunMessage::new(ALLOCATE_REQUEST, tx_id)
+            .with_attribute(StunAttribute::RequestedTransport(17))
+            .with_attribute(StunAttribute::Lifetime(self.config.lifetime_sec))
+            .with_attribute(StunAttribute::Username(self.config.username.clone()))
+            .with_attribute(StunAttribute::Realm(self.realm.clone()))
+            .with_attribute(StunAttribute::Nonce(self.nonce.clone()));
+
+        let resp = self.send_authenticated_request(req, &tx_id).await?;
+        if let Some((code, reason)) = resp.error_code() {
+            return Err(TurnError::StunErrorResponse {
+                code,
+                reason: reason.to_string(),
+            });
+        }
+        Ok(resp)
+    }
+
+    async fn create_permission_internal(&mut self) -> Result<(), TurnError> {
+        let mut tx_id = [0u8; 12];
+        rand::rng().fill_bytes(&mut tx_id);
+
+        let req = StunMessage::new(CREATE_PERMISSION_REQUEST, tx_id)
+            .with_attribute(StunAttribute::XorPeerAddress(self.config.peer_addr))
+            .with_attribute(StunAttribute::Username(self.config.username.clone()))
+            .with_attribute(StunAttribute::Realm(self.realm.clone()))
+            .with_attribute(StunAttribute::Nonce(self.nonce.clone()));
+
+        let resp = self.send_authenticated_request(req, &tx_id).await?;
+        if let Some((code, reason)) = resp.error_code() {
+            return Err(TurnError::StunErrorResponse {
+                code,
+                reason: reason.to_string(),
+            });
+        }
+        debug!(
+            "TURN CreatePermission succeeded for {}",
+            self.config.peer_addr
+        );
+        Ok(())
+    }
+
+    async fn channel_bind_internal(&mut self) -> Result<(), TurnError> {
+        let mut tx_id = [0u8; 12];
+        rand::rng().fill_bytes(&mut tx_id);
+
+        let req = StunMessage::new(CHANNEL_BIND_REQUEST, tx_id)
+            .with_attribute(StunAttribute::ChannelNumber(self.config.channel_number))
+            .with_attribute(StunAttribute::XorPeerAddress(self.config.peer_addr))
+            .with_attribute(StunAttribute::Username(self.config.username.clone()))
+            .with_attribute(StunAttribute::Realm(self.realm.clone()))
+            .with_attribute(StunAttribute::Nonce(self.nonce.clone()));
+
+        let resp = self.send_authenticated_request(req, &tx_id).await?;
+        if let Some((code, reason)) = resp.error_code() {
+            return Err(TurnError::StunErrorResponse {
+                code,
+                reason: reason.to_string(),
+            });
+        }
+        info!(
+            "TURN ChannelBind succeeded: channel 0x{:04X} -> {}",
+            self.config.channel_number, self.config.peer_addr
+        );
+        Ok(())
+    }
+
+    /// Send authenticated request with automatic 438 Stale Nonce recovery.
+    async fn send_authenticated_request(
+        &mut self,
+        mut req: StunMessage,
+        tx_id: &[u8; 12],
+    ) -> Result<StunMessage, TurnError> {
+        let resp = self.send_stun_packet(&req, tx_id, Some(&self.key)).await?;
+
+        // RFC 5389 Section 10.2: If 438 Stale Nonce, update nonce and retry once
+        if let Some((code, _)) = resp.error_code()
+            && code == CODE_STALE_NONCE
+            && let Some(new_nonce) = resp.nonce()
+        {
+            warn!("Received 438 Stale Nonce. Updating nonce to {new_nonce} and retrying...");
+            self.nonce = new_nonce.to_string();
+            self.key =
+                compute_long_term_key(&self.config.username, &self.realm, &self.config.password);
+
+            // Re-populate nonce in request attributes
+            for attr in &mut req.attributes {
+                if let StunAttribute::Nonce(n) = attr {
+                    *n = self.nonce.clone();
+                }
+            }
+
+            return self.send_stun_packet(&req, tx_id, Some(&self.key)).await;
+        }
+
+        Ok(resp)
+    }
+
+    /// Send raw STUN packet with retries.
+    async fn send_stun_packet(
         &self,
         req: &StunMessage,
         tx_id: &[u8; 12],

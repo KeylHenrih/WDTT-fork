@@ -5,8 +5,18 @@ use std::time::{Duration, Instant};
 /// At 1 Gbps with ~104,000 pps, 16,384 slots covers ~157 ms of multi-stream skew.
 pub const DEFAULT_RESEQUENCER_CAPACITY: usize = 16_384;
 
-/// Default gap timeout before skipping a lost packet (3 milliseconds).
-pub const DEFAULT_GAP_TIMEOUT: Duration = Duration::from_millis(3);
+/// Default baseline gap timeout before skipping a lost packet (5 milliseconds).
+pub const DEFAULT_GAP_TIMEOUT: Duration = Duration::from_millis(5);
+
+/// Minimum allowable adaptive gap timeout.
+pub const MIN_GAP_TIMEOUT: Duration = Duration::from_millis(5);
+
+/// Maximum allowable adaptive gap timeout (80 milliseconds).
+pub const MAX_GAP_TIMEOUT: Duration = Duration::from_millis(80);
+
+/// Maximum allowable forward jump in sequence counter before rejection (65,536 packets).
+/// Protects against malicious or corrupted counter bursts that would otherwise force window advance.
+pub const MAX_FORWARD_COUNTER_JUMP: u64 = 65_536;
 
 /// Maximum concurrent receiver indices tracked simultaneously (WireGuard rekeying window).
 pub const MAX_RECEIVER_STREAMS: usize = 4;
@@ -25,6 +35,7 @@ pub struct ResequencerStats {
     pub packets_reordered: u64,
     pub packets_duplicate_or_late: u64,
     pub packets_dropped_overflow: u64,
+    pub packets_invalid_counter_jump: u64,
     pub gaps_skipped_timeout: u64,
     pub max_reorder_depth: u16,
 }
@@ -62,6 +73,20 @@ impl ReceiverStreamState {
         }
     }
 
+    /// Update adaptive gap timeout based on measured path skew.
+    ///
+    /// The formula allocates 1.25x measured skew plus a 5ms margin, clamped to [MIN_GAP_TIMEOUT, MAX_GAP_TIMEOUT].
+    /// For example, at a measured skew of 35ms:
+    /// `35ms * 1.25 + 5ms = 48.75ms` (clamped to 48ms), ensuring packets from the slower path
+    /// are not declared lost prematurely.
+    pub fn update_measured_skew(&mut self, skew: Duration) {
+        let adaptive_ms = ((skew.as_millis() as f64 * 1.25) as u64 + 5).clamp(
+            MIN_GAP_TIMEOUT.as_millis() as u64,
+            MAX_GAP_TIMEOUT.as_millis() as u64,
+        );
+        self.gap_timeout = Duration::from_millis(adaptive_ms);
+    }
+
     /// Reset stream counter state (e.g. on `REORDER_RESET` flag).
     pub fn reset(&mut self, next_expected: u64) {
         self.expected_counter = next_expected;
@@ -94,6 +119,13 @@ impl ReceiverStreamState {
 
         // 3. Packet is ahead of expected counter (reordering detected).
         let delta = counter - self.expected_counter;
+
+        // Reject catastrophic forward counter jumps to protect session window.
+        if delta > MAX_FORWARD_COUNTER_JUMP {
+            self.stats.packets_invalid_counter_jump += 1;
+            return;
+        }
+
         let depth = delta.min(u16::MAX as u64) as u16;
         if depth > self.stats.max_reorder_depth {
             self.stats.max_reorder_depth = depth;
@@ -236,6 +268,16 @@ impl WgResequencer {
         }
     }
 
+    /// Update adaptive gap timeout for a specific receiver stream based on measured path skew.
+    pub fn update_measured_skew(&mut self, receiver_index: u32, skew: Duration) {
+        for stream in &mut self.streams {
+            if stream.receiver_index == receiver_index {
+                stream.update_measured_skew(skew);
+                return;
+            }
+        }
+    }
+
     /// Retrieve or allocate stream state for `receiver_index`.
     fn get_or_create_stream(
         &mut self,
@@ -284,6 +326,65 @@ impl WgResequencer {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    #[test]
+    fn test_adaptive_gap_timeout_with_35ms_skew() {
+        let t0 = Instant::now();
+        let mut reseq = WgResequencer::new(1024, DEFAULT_GAP_TIMEOUT);
+        let mut out = Vec::new();
+
+        // 1. Initial packet 0
+        reseq.push(1, 0, Bytes::from_static(b"p0"), t0, &mut out);
+        assert_eq!(out.len(), 1);
+
+        // 2. Set measured path skew to 35ms (adaptive timeout -> 48ms)
+        reseq.update_measured_skew(1, Duration::from_millis(35));
+
+        // 3. Fast stream delivers packet 2 ahead of packet 1
+        reseq.push(1, 2, Bytes::from_static(b"p2"), t0, &mut out);
+        assert_eq!(out.len(), 1); // packet 2 is buffered waiting for 1
+
+        // 4. Tick at 35ms (matching skew) -> packet 1 is NOT declared lost
+        reseq.tick(t0 + Duration::from_millis(35), &mut out);
+        assert_eq!(out.len(), 1);
+
+        // 5. Delayed packet 1 arrives from slow stream at 36ms!
+        reseq.push(
+            1,
+            1,
+            Bytes::from_static(b"p1"),
+            t0 + Duration::from_millis(36),
+            &mut out,
+        );
+        assert_eq!(out.len(), 3); // 0, 1, 2 all emitted in order without loss!
+        assert_eq!(out[0], Bytes::from_static(b"p0"));
+        assert_eq!(out[1], Bytes::from_static(b"p1"));
+        assert_eq!(out[2], Bytes::from_static(b"p2"));
+
+        let stats = reseq.stats(1).unwrap();
+        assert_eq!(stats.gaps_skipped_timeout, 0);
+    }
+
+    #[test]
+    fn test_catastrophic_counter_jump_rejected() {
+        let now = Instant::now();
+        let mut reseq = WgResequencer::new(1024, DEFAULT_GAP_TIMEOUT);
+        let mut out = Vec::new();
+
+        reseq.push(1, 0, Bytes::from_static(b"p0"), now, &mut out);
+        assert_eq!(out.len(), 1);
+
+        // Feed catastrophic jump > MAX_FORWARD_COUNTER_JUMP (e.g. 100,000)
+        reseq.push(1, 100_000, Bytes::from_static(b"malicious"), now, &mut out);
+        assert_eq!(out.len(), 1);
+
+        let stats = reseq.stats(1).unwrap();
+        assert_eq!(stats.packets_invalid_counter_jump, 1);
+
+        // Next legitimate packet 1 still accepted in order
+        reseq.push(1, 1, Bytes::from_static(b"p1"), now, &mut out);
+        assert_eq!(out.len(), 2);
+    }
 
     #[test]
     fn test_in_order_delivery() {
