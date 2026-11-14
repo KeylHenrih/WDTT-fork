@@ -80,8 +80,10 @@ impl TurnClient {
         let sock2 =
             socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
         sock2.set_nonblocking(true)?;
-        let _ = sock2.set_recv_buffer_size(4 * 1024 * 1024);
-        let _ = sock2.set_send_buffer_size(4 * 1024 * 1024);
+        if std::env::var("WDTT_DISABLE_SOCK_TUNE").is_err() {
+            let _ = sock2.set_recv_buffer_size(4 * 1024 * 1024);
+            let _ = sock2.set_send_buffer_size(4 * 1024 * 1024);
+        }
         sock2.bind(&local_bind.into())?;
         let std_socket: std::net::UdpSocket = sock2.into();
         let socket = UdpSocket::from_std(std_socket)?;
