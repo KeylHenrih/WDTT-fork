@@ -97,8 +97,8 @@ impl AntiReplayWindow {
             for i in (word_shift..REPLAY_WINDOW_WORDS).rev() {
                 self.bitmap[i] = self.bitmap[i - word_shift];
             }
-            for i in 0..word_shift {
-                self.bitmap[i] = 0;
+            for word in self.bitmap.iter_mut().take(word_shift) {
+                *word = 0;
             }
         }
 
