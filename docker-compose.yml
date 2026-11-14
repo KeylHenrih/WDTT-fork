@@ -1,0 +1,11 @@
+services:
+  coturn:
+    image: docker.io/coturn/coturn:latest
+    container_name: wdtt-coturn-test
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./docker/coturn/turnserver.conf:/etc/coturn/turnserver.conf:ro
+    command:
+      - "-c"
+      - "/etc/coturn/turnserver.conf"

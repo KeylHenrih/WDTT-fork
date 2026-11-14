@@ -13,3 +13,10 @@ tracing = { workspace = true }
 tokio = { workspace = true }
 wdtt-proto = { workspace = true }
 wdtt-crypto = { workspace = true }
+sha1 = { workspace = true }
+md-5 = { workspace = true }
+hmac = { workspace = true }
+rand = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

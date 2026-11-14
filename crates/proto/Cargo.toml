@@ -12,3 +12,6 @@ thiserror = { workspace = true }
 serde = { workspace = true }
 url = { workspace = true }
 siphasher = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

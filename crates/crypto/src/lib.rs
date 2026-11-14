@@ -1,28 +1,16 @@
-//! Cryptographic primitives for WDTT v2.
-//!
-//! Provides AEAD encryption (ChaCha20-Poly1305 and AES-GCM), HKDF key derivation,
-//! zeroize-backed secrets management, and constant-time RFC 6479 anti-replay window.
-
 #![forbid(unsafe_code)]
-#![deny(missing_docs)]
+#![doc = include_str!("../README.md")]
 
-/// Length of an AEAD authentication tag in bytes.
-pub const AEAD_TAG_LEN: usize = 16;
+pub mod aead;
+pub mod anti_replay;
+pub mod error;
+pub mod kdf;
+pub mod key;
+pub mod knock;
 
-/// Length of a standard AEAD nonce in bytes.
-pub const AEAD_NONCE_LEN: usize = 12;
-
-/// Length of a derived symmetric session key in bytes.
-pub const KEY_LEN: usize = 32;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_crypto_constants() {
-        assert_eq!(AEAD_TAG_LEN, 16);
-        assert_eq!(AEAD_NONCE_LEN, 12);
-        assert_eq!(KEY_LEN, 32);
-    }
-}
+pub use aead::{AeadEngine, CipherSuite, NONCE_LEN, TAG_LEN, make_nonce};
+pub use anti_replay::{AntiReplayWindow, REPLAY_WINDOW_SIZE, REPLAY_WINDOW_WORDS};
+pub use error::CryptoError;
+pub use kdf::derive_session_keys;
+pub use key::{AeadKey, KnockKey, Psk, SessionKeys};
+pub use knock::{DEFAULT_MAX_CLOCK_SKEW_SEC, KNOCK_TAG_LEN, KnockAuthenticator};

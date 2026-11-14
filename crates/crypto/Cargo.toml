@@ -17,3 +17,6 @@ hmac = { workspace = true }
 zeroize = { workspace = true }
 subtle = { workspace = true }
 rand = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
