@@ -37,6 +37,27 @@ impl Default for TurnClientConfig {
     }
 }
 
+/// Incoming multiplexed packet received from a TURN server.
+#[derive(Debug, Clone)]
+pub enum TurnIncoming {
+    /// ChannelData payload received on a bound channel.
+    ChannelData {
+        /// Channel number (e.g. 0x4000).
+        channel: u16,
+        /// Payload data.
+        payload: Bytes,
+    },
+    /// DataIndication (RFC 5766 Section 10) before channel binding is established.
+    DataIndication {
+        /// Peer socket address sending the data.
+        peer_addr: SocketAddr,
+        /// Payload data.
+        payload: Bytes,
+    },
+    /// Other STUN message (e.g. keepalive/binding).
+    Stun(StunMessage),
+}
+
 /// Asynchronous TURN Client with automatic 438 Stale Nonce recovery and keepalive lifecycle management.
 pub struct TurnClient {
     socket: Arc<UdpSocket>,
@@ -73,11 +94,19 @@ impl TurnClient {
         self.config.peer_addr = peer_addr;
     }
 
-    /// Perform full TURN allocation, permission grant, and channel binding.
-    pub async fn allocate(&mut self) -> Result<SocketAddr, TurnError> {
+    /// Update target peer and establish permission and channel binding.
+    pub async fn bind_peer(&mut self, peer_addr: SocketAddr) -> Result<(), TurnError> {
+        self.config.peer_addr = peer_addr;
+        self.create_permission_internal().await?;
+        self.channel_bind_internal().await?;
+        Ok(())
+    }
+
+    /// Perform TURN allocation only, obtaining the relayed address without establishing peer bindings.
+    pub async fn allocate_relay(&mut self) -> Result<SocketAddr, TurnError> {
         info!(
-            "Initiating TURN allocation to {} for peer {}",
-            self.config.server_addr, self.config.peer_addr
+            "Initiating TURN allocation to {} (relay-only)",
+            self.config.server_addr
         );
 
         // 1. Initial unauthenticated Allocate to get 401 challenge
@@ -118,13 +147,20 @@ impl TurnClient {
         self.relayed_addr = Some(relayed_addr);
         info!("TURN allocation granted: relayed addr = {relayed_addr}");
 
+        self.allocated.store(true, Ordering::SeqCst);
+        Ok(relayed_addr)
+    }
+
+    /// Perform full TURN allocation, permission grant, and channel binding.
+    pub async fn allocate(&mut self) -> Result<SocketAddr, TurnError> {
+        let relayed_addr = self.allocate_relay().await?;
+
         // 3. Create Permission for peer
         self.create_permission_internal().await?;
 
         // 4. ChannelBind peer to channel number
         self.channel_bind_internal().await?;
 
-        self.allocated.store(true, Ordering::SeqCst);
         Ok(relayed_addr)
     }
 
@@ -154,6 +190,12 @@ impl TurnClient {
 
     /// Refresh permission for target peer before 300s expiration (RFC 5766 Section 8).
     pub async fn refresh_permission(&mut self) -> Result<(), TurnError> {
+        self.create_permission_internal().await
+    }
+
+    /// Explicitly grant permission for an IP address (RFC 5766 Section 8).
+    pub async fn create_permission(&mut self, peer_addr: SocketAddr) -> Result<(), TurnError> {
+        self.config.peer_addr = peer_addr;
         self.create_permission_internal().await
     }
 
@@ -187,6 +229,35 @@ impl TurnClient {
                 return Ok(Some(payload));
             }
         }
+        Ok(None)
+    }
+
+    /// Receive an incoming packet from the TURN socket, parsing ChannelData or STUN DataIndication.
+    pub async fn recv_incoming(&self, buf: &mut [u8]) -> Result<Option<TurnIncoming>, TurnError> {
+        let (len, src) = self.socket.recv_from(buf).await?;
+        if src != self.config.server_addr {
+            return Ok(None);
+        }
+
+        let slice = &buf[..len];
+        if is_channel_data(slice) {
+            let (channel, payload, _) = decode_channel_data(slice)?;
+            return Ok(Some(TurnIncoming::ChannelData { channel, payload }));
+        }
+
+        if let Ok(msg) = StunMessage::decode(slice) {
+            if msg.message_type == DATA_INDICATION
+                && let Some(peer_addr) = msg.peer_address()
+                && let Some(data) = msg.data()
+            {
+                return Ok(Some(TurnIncoming::DataIndication {
+                    peer_addr,
+                    payload: data.clone(),
+                }));
+            }
+            return Ok(Some(TurnIncoming::Stun(msg)));
+        }
+
         Ok(None)
     }
 

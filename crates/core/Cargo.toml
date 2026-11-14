@@ -12,6 +12,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
+rand = { workspace = true }
 wdtt-proto = { workspace = true }
 wdtt-crypto = { workspace = true }
 wdtt-turn = { workspace = true }

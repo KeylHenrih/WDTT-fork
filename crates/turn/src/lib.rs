@@ -11,7 +11,7 @@ pub use channel::{
     CHANNEL_DATA_HEADER_LEN, CHANNEL_MAX, CHANNEL_MIN, decode_channel_data, encode_channel_data,
     is_channel_data,
 };
-pub use client::{TurnClient, TurnClientConfig};
+pub use client::{TurnClient, TurnClientConfig, TurnIncoming};
 pub use error::TurnError;
 pub use mock_server::MockTurnServer;
 pub use stun::{

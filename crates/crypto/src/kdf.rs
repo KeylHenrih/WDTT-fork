@@ -7,6 +7,17 @@ const SALT_SESSION_PREFIX: &[u8] = b"WDTT-v2-SESSION-SALT-2026";
 const INFO_CLIENT_KEY: &[u8] = b"wdtt2 client write key";
 const INFO_SERVER_KEY: &[u8] = b"wdtt2 server write key";
 const INFO_KNOCK_KEY: &[u8] = b"wdtt2 pre-auth knock key";
+const INFO_PRE_AUTH_KNOCK_KEY: &[u8] = b"wdtt2 static pre-auth knock key";
+const SALT_PRE_AUTH_KNOCK: &[u8] = b"WDTT-v2-PRE-AUTH-KNOCK-SALT";
+
+/// Derive pre-auth knock key directly from PSK.
+pub fn derive_pre_auth_knock_key(psk: &Psk) -> KnockKey {
+    let hk = Hkdf::<Sha256>::new(Some(SALT_PRE_AUTH_KNOCK), psk.as_bytes());
+    let mut knock_key_bytes = [0u8; 32];
+    hk.expand(INFO_PRE_AUTH_KNOCK_KEY, &mut knock_key_bytes)
+        .expect("expand 32-byte knock key");
+    KnockKey::from_bytes(knock_key_bytes)
+}
 
 /// Derive session keys from Pre-Shared Key (PSK) and exchanged session nonces.
 pub fn derive_session_keys(

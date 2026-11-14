@@ -140,6 +140,26 @@ impl StunMessage {
         None
     }
 
+    /// Retrieve XorPeerAddress attribute.
+    pub fn peer_address(&self) -> Option<SocketAddr> {
+        for attr in &self.attributes {
+            if let StunAttribute::XorPeerAddress(addr) = attr {
+                return Some(*addr);
+            }
+        }
+        None
+    }
+
+    /// Retrieve Data attribute payload.
+    pub fn data(&self) -> Option<&Bytes> {
+        for attr in &self.attributes {
+            if let StunAttribute::Data(bytes) = attr {
+                return Some(bytes);
+            }
+        }
+        None
+    }
+
     /// Encode STUN message into binary buffer.
     pub fn encode(&self) -> BytesMut {
         let mut body = BytesMut::new();

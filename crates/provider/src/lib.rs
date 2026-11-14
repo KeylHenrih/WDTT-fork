@@ -1,10 +1,39 @@
 //! Trait definitions and implementations for TURN credential providers.
 //!
-//! Abstracts VK Calls anonymous credential generation, static coturn configurations,
-//! and REST-based credential endpoints.
+//! Abstracts static coturn configurations, REST-based credential endpoints,
+//! and future dynamic call relay providers.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
+
+use async_trait::async_trait;
+
+/// Error type returned by TURN credential providers.
+#[derive(Debug, thiserror::Error, PartialEq, Eq, Clone)]
+pub enum ProviderError {
+    /// Network or I/O failure during credential acquisition.
+    #[error("network error: {0}")]
+    Network(String),
+
+    /// Authentication failure against credential service.
+    #[error("authentication failed: {0}")]
+    Authentication(String),
+
+    /// Credentials have permanently expired and cannot be refreshed.
+    #[error("credentials expired")]
+    Expired,
+
+    /// Provider hit rate limit; retry after the specified seconds.
+    #[error("rate limited; retry after {retry_after_secs}s")]
+    RateLimited {
+        /// Suggested retry interval in seconds.
+        retry_after_secs: u32,
+    },
+
+    /// Other provider-specific error.
+    #[error("provider error: {0}")]
+    Other(String),
+}
 
 /// Active TURN server credentials acquired by a provider.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -15,12 +44,62 @@ pub struct TurnCredentials {
     pub password: String,
     /// Relay server host address (domain or IP).
     pub host: String,
-    /// Relay server port (default 443).
+    /// Relay server port (default 3478 / 443).
     pub port: u16,
+    /// Relay server realm (default "coturn" or similar).
+    pub realm: String,
     /// Whether the relay connection should use UDP or TCP/TLS.
     pub use_udp: bool,
-    /// Expiration timestamp in seconds since UNIX epoch.
+    /// Expiration timestamp in seconds since UNIX epoch (0 = indefinite).
     pub expires_at: u64,
+}
+
+impl TurnCredentials {
+    /// Checks whether credentials have expired at the given timestamp.
+    pub fn is_expired(&self, now_secs: u64) -> bool {
+        self.expires_at > 0 && now_secs >= self.expires_at
+    }
+}
+
+/// Abstract trait for acquiring and refreshing TURN server credentials.
+#[async_trait]
+pub trait TurnProvider: Send + Sync {
+    /// Acquired new credentials from the provider.
+    async fn acquire_credentials(&self) -> Result<TurnCredentials, ProviderError>;
+
+    /// Refreshes existing credentials before expiration.
+    async fn refresh_credentials(
+        &self,
+        current: &TurnCredentials,
+    ) -> Result<TurnCredentials, ProviderError>;
+}
+
+/// Static provider supplying fixed TURN credentials (e.g. for dedicated coturn deployments).
+#[derive(Debug, Clone)]
+pub struct StaticTurnProvider {
+    creds: TurnCredentials,
+}
+
+impl StaticTurnProvider {
+    /// Creates a new static TURN credentials provider.
+    pub fn new(creds: TurnCredentials) -> Self {
+        Self { creds }
+    }
+}
+
+#[async_trait]
+impl TurnProvider for StaticTurnProvider {
+    async fn acquire_credentials(&self) -> Result<TurnCredentials, ProviderError> {
+        Ok(self.creds.clone())
+    }
+
+    async fn refresh_credentials(
+        &self,
+        _current: &TurnCredentials,
+    ) -> Result<TurnCredentials, ProviderError> {
+        // Static credentials do not change on refresh
+        Ok(self.creds.clone())
+    }
 }
 
 /// Events emitted by credential providers, including user interaction challenges.
@@ -51,16 +130,40 @@ pub enum ProviderEvent {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_credentials_struct() {
+    #[tokio::test]
+    async fn test_static_turn_provider() {
         let creds = TurnCredentials {
-            username: "user".into(),
-            password: "pass".into(),
-            host: "turn.example.com".into(),
-            port: 443,
-            use_udp: false,
-            expires_at: 1893456000,
+            username: "turnuser".into(),
+            password: "turnpassword".into(),
+            host: "127.0.0.1".into(),
+            port: 3478,
+            realm: "wdtt-test".into(),
+            use_udp: true,
+            expires_at: 0,
         };
-        assert_eq!(creds.port, 443);
+
+        let provider = StaticTurnProvider::new(creds.clone());
+        let acquired = provider.acquire_credentials().await.unwrap();
+        assert_eq!(acquired, creds);
+        assert!(!acquired.is_expired(9999999999));
+
+        let refreshed = provider.refresh_credentials(&acquired).await.unwrap();
+        assert_eq!(refreshed, creds);
+    }
+
+    #[test]
+    fn test_credentials_expiration() {
+        let creds = TurnCredentials {
+            username: "u".into(),
+            password: "p".into(),
+            host: "127.0.0.1".into(),
+            port: 3478,
+            realm: "r".into(),
+            use_udp: true,
+            expires_at: 1000,
+        };
+        assert!(!creds.is_expired(999));
+        assert!(creds.is_expired(1000));
+        assert!(creds.is_expired(1001));
     }
 }
