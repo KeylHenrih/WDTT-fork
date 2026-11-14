@@ -10,7 +10,7 @@
 ## 1. Контекст и профилирование (Чистый стенд vs strace)
 
 ### 1.1 Чистый прогон с привязкой ядер (P-cores / E-cores via taskset, без strace):
-В чистом замере на одиночном TCP-потоке (`-P 1`) без вмешательства `strace/ptrace` ([docs/flamegraph_stage4_1_clean.svg](file:///home/keyl/Projects/WDTT-fork/docs/flamegraph_stage4_1_clean.svg)) получены следующие эмпирические показатели (`pidstat -t` на P-core 2 @ 4.9 ГГц):
+В чистом замере на одиночном TCP-потоке (`-P 1`) без вмешательства `strace/ptrace` ([docs/flamegraph_stage4_1_clean.svg](flamegraph_stage4_1_clean.svg)) получены следующие эмпирические показатели (`pidstat -t` на P-core 2 @ 4.9 ГГц):
 - **Пропускная способность:** **1846.02–1920.16 Мбит/с** (~1.85–1.92 Гбит/с)
 - **Интенсивность:** **192 293–200 016 pps**
 - **Загрузка CPU `wdtt-server`:** **39.6% одного физического P-core** (%usr 5.0%, %sys 34.6%)

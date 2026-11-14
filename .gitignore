@@ -1,11 +1,42 @@
+# Build artifacts
 target/
 **/target/
+*.bin
+*.so
+*.dylib
+*.dll
+*.a
+*.exe
+
+# Fuzzing artifacts
 fuzz/corpus/
 fuzz/artifacts/
-**/*.rs.bk
+
+# Credentials, secrets, and environment
+*.env
+*.env.*
+*.link
+*link*
+link
+passwords*.json
+*.key
+*.pem
+*.crt
+*.pfx
+
+# Logs and profiling data
+*.log
+transcript*
+transcript*.jsonl
+perf.data*
+*.pcap
+*.pcapng
+/tmp/*
+
+# Editor and OS files
+.DS_Store
+.idea/
+.vscode/
 *.swp
 *.orig
-.DS_Store
-.idea
-.vscode
-*.log
+**/*.rs.bk

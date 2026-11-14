@@ -8,7 +8,7 @@ use url::Url;
 pub const DEFAULT_WORKERS: u8 = 4;
 
 /// Architectural upper bound estimate of concurrent TURN streams before STUN 486
-/// (ADR-0002 / ADR-0006 architectural estimate, pending cz-1 quota measurement).
+/// (ADR-0002 / ADR-0006 architectural estimate, pending external server quota measurement).
 pub const MAX_WORKERS_ESTIMATE: u8 = 8;
 
 /// Tunnel transport mode.
