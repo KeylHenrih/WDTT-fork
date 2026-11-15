@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Git pre-commit hook to detect secrets before committing
+set -e
+
+if command -v gitleaks >/dev/null 2>&1; then
+    gitleaks protect --staged -v
+else
+    echo "Warning: gitleaks is not installed. Skipping local secret leak check."
+fi

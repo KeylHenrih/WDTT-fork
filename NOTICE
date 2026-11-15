@@ -1,0 +1,30 @@
+WDTT Ecosystem (wdtt-rs)
+Copyright (c) 2026 The WDTT Authors
+
+This project is licensed under the GNU General Public License v3.0 (GPL-3.0-only).
+See LICENSE for details.
+
+================================================================================
+Благодарности и история проекта / Acknowledgments and Attribution
+================================================================================
+
+Проект `wdtt-rs` является независимой разработкой экосистемы туннелирования
+WireGuard поверх протоколов WebRTC TURN/DTLS с собственной спецификацией проводного
+протокола WDTT v2 (docs/PROTOCOL.md).
+
+Выражаем благодарность авторам и участникам сообщества оригинальных проектов,
+исследования и опыт которых послужили стимулом для создания данной независимой реализации:
+
+- WDTT / vk-turn-proxy (cacggghp, MYSOREZ, anton48)
+- PWDTT (luminescq)
+- qWDTT (SpaceNeuroX)
+- WDTT Plus (Ivan4537)
+- CSQTT (amurcanov)
+
+Заявление об авторстве и независимости реализации / Attribution statement:
+Данный проект является полностью независимой реализацией по собственной спецификации.
+Код проекта CSQTT (распространяемого под некоммерческой лицензией PolyForm Noncommercial)
+не заимствован и не используется ни в одной части настоящего репозитория.
+
+This project is an independent clean-room implementation developed according to custom
+specifications (docs/PROTOCOL.md). No code from CSQTT is used in this repository.

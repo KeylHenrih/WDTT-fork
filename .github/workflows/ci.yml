@@ -1,0 +1,140 @@
+name: CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+permissions: read-all
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  fmt-and-clippy:
+    name: Code Formatting and Linter
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Check Formatting
+        run: cargo fmt --all -- --check
+      - name: Run Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+  cargo-deny:
+    name: License & Advisory Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
+  gitleaks:
+    name: Secret Leak Detection (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  test-workspace:
+    name: Unit & Integration Tests (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run Workspace Tests
+        run: cargo test --workspace --verbose
+
+  cross-platform-check:
+    name: Cross-platform Matrix Check (${{ matrix.target }})
+    needs: [fmt-and-clippy]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: macos-latest
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Cargo Check Target
+        run: cargo check --workspace --target ${{ matrix.target }}
+
+  server-musl-build:
+    name: Server Static Musl Build (x86_64)
+    needs: [fmt-and-clippy]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - name: Install musl-tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - uses: Swatinem/rust-cache@v2
+      - name: Build Server Static Binary
+        run: cargo build --package wdtt-server --release --target x86_64-unknown-linux-musl
+
+  android-ndk-check:
+    name: Android NDK Build (arm64-v8a)
+    needs: [fmt-and-clippy]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r26d
+          add-to-path: true
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+      - name: Build Android cdylib
+        run: cargo ndk -t arm64-v8a build -p wdtt-ffi-android --lib
+
+  fuzz-smoke-test:
+    name: Fuzz Smoke Tests (cargo-fuzz)
+    needs: [fmt-and-clippy]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-fuzz prebuilt binary
+        run: |
+          mkdir -p ~/.cargo/bin
+          curl -sL https://github.com/rust-fuzz/cargo-fuzz/releases/download/0.13.2/cargo-fuzz-0.13.2-x86_64-unknown-linux-musl.tar.gz | tar xz -C ~/.cargo/bin
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+      - name: Run Fuzz URL
+        run: cargo fuzz run --target x86_64-unknown-linux-gnu fuzz_url -- -max_total_time=5
+      - name: Run Fuzz Frame
+        run: cargo fuzz run --target x86_64-unknown-linux-gnu fuzz_frame -- -max_total_time=5
+      - name: Run Fuzz STUN
+        run: cargo fuzz run --target x86_64-unknown-linux-gnu fuzz_stun -- -max_total_time=5
