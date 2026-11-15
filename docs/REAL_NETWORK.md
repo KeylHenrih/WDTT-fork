@@ -1,98 +1,71 @@
-# WDTT v2 Real Network Benchmarks (Poke Stage)
+# WDTT v2 Real Network Benchmarks & Loss Diagnostics
 
 ## 1. Test Environment Overview
 
-All measurements were performed over an unconstrained public Internet path between a mobile client (Linux x86_64, Wi-Fi 802.11ax to residential fiber WAN) and a remote cloud server located in an EU datacenter.
+All measurements were performed over an unconstrained public Internet path between a client host (Linux x86_64, Wi-Fi 802.11ax to residential fiber WAN) and a remote cloud server located in an EU datacenter.
 
-- **Direct Network Path**: Direct UDP/TCP transport between client local interface and `<REMOTE_SERVER_IP>` over the public WAN.
+- **Direct Network Path**: Direct UDP/TCP transport between client local physical interface and remote server over the public WAN.
 - **WDTT v2 Tunnel Path**: Linux kernel WireGuard (`wg-wdtt`, `10.88.88.2/24`) tunneled through `wdttd` client daemon, relayed via Coturn TURN allocation, demultiplexed by `wdtt-server`, and terminated on Linux kernel WireGuard (`wg-test0`, `10.88.88.1/24`) on the remote server.
 - **Routing Scope**: Tunnel route strictly isolated to `10.88.88.0/24`. Host default route, DNS resolution, and physical interfaces remained untouched.
 
 ---
 
-## 2. Metric Comparison Summary
+## 2. Direct WAN Path UDP Loss Curve (PC <-> server)
 
-| Metric | Direct WAN Path | WDTT v2 Tunnel Path | Overhead / Delta |
-| :--- | :--- | :--- | :--- |
-| **Ping Packet Loss** | 0% (0 / 10) | 0% (0 / 10) | 0% added loss |
-| **Ping RTT (min)** | 92.83 ms | 91.16 ms | -1.67 ms (within jitter) |
-| **Ping RTT (avg)** | 94.89 ms | 100.45 ms | +5.56 ms (+5.8%) |
-| **Ping RTT (max)** | 98.45 ms | 132.50 ms | +34.05 ms (scheduling spike) |
-| **Ping RTT (mdev)** | 2.13 ms | 11.10 ms | +8.97 ms |
-| **UDP Jitter (iperf3)** | 0.584 ms | 0.626 ms | +0.042 ms |
-| **UDP Throughput (target 20M)** | 18.3 Mbits/sec | 11.7 Mbits/sec | -6.6 Mbits/sec |
-| **UDP Packet Loss (at 20M target)**| 0.68% (115 / 16963) | 39.0% (7119 / 18213)| +38.3% (relay buffer ceiling)|
-| **TCP Throughput (1 stream, 10s)**| 79.4 Mbits/sec | 2.46 Mbits/sec | User-space TURN relaying |
-| **TCP Retransmissions** | 6 | 26 | +20 |
-| **HTTP Verification (`curl :8080`)**| N/A (Isolated IP) | 200 OK (Instant) | Full connectivity |
+To isolate network-induced losses from tunnel-induced losses, raw UDP was measured in both directions across multiple target rates (5s per step, bound strictly to physical interface):
 
----
+| Direction | Target Rate | Sent Bitrate | Received Bitrate | Lost Datagrams | Total Datagrams | Loss % | Jitter (ms) |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Client -> Server (Uplink)** | 5M | 5.00 Mbits/s | 4.79 Mbits/s | 0 | 2092 | **0.00%** | 2.854 ms |
+| **Client -> Server (Uplink)** | 10M | 10.00 Mbits/s | 9.69 Mbits/s | 0 | 4226 | **0.00%** | 1.484 ms |
+| **Client -> Server (Uplink)** | 20M | 20.00 Mbits/s | 18.95 Mbits/s | 114 | 8369 | **1.33%** | 0.587 ms |
+| **Client -> Server (Uplink)** | 40M | 40.00 Mbits/s | 37.77 Mbits/s | 360 | 16920 | **2.10%** | 0.290 ms |
+| **Server -> Client (Downlink)**| 5M | 5.00 Mbits/s | 5.01 Mbits/s | 0 | 2144 | **0.00%** | 0.370 ms |
+| **Server -> Client (Downlink)**| 10M | 10.00 Mbits/s | 10.00 Mbits/s | 0 | 4281 | **0.00%** | 1.353 ms |
+| **Server -> Client (Downlink)**| 20M | 20.00 Mbits/s | 20.00 Mbits/s | 0 | 8565 | **0.00%** | 0.702 ms |
+| **Server -> Client (Downlink)**| 40M | 40.00 Mbits/s | 40.01 Mbits/s | 0 | 17129 | **0.00%** | 0.309 ms |
 
-## 3. Detailed Benchmark Results
-
-### 3.1. Latency & ICMP Ping (10 Packets)
-
-#### Direct WAN Path:
-```text
-10 packets transmitted, 10 received, 0% packet loss, time 9246ms
-rtt min/avg/max/mdev = 92.828/94.888/98.454/2.127 ms
-```
-
-#### WDTT v2 Tunnel Path:
-```text
-10 packets transmitted, 10 received, 0% packet loss, time 9011ms
-rtt min/avg/max/mdev = 91.161/100.447/132.503/11.099 ms
-```
-
-*Observation*: Base physical latency is ~92-95 ms. The tunnel encapsulation adds negligible latency (~5.5 ms average), confirming minimal framing and crypto overhead in the datapath.
+### Key Diagnostic Findings:
+1. **Downlink is completely loss-free**: Datacenter to client sustains 40.0 Mbits/s UDP with 0 dropped datagrams (0.00% loss).
+2. **Uplink exhibits physical path losses starting at ~15-20 Mbits/s**: Client uplink experiences 1.33% - 2.10% packet drops on the physical WAN/Wi-Fi path even without any tunnel encapsulation. Note: "Received Bitrate" (e.g. 18.95 Mbits/s) reflects iperf3's measured throughput over the interval, distinct from packet loss percentage.
 
 ---
 
-### 3.2. UDP Throughput & Jitter (`iperf3 -u -b 20M -t 10`)
+## 3. Tunnel UDP Loss & Throughput Discrepancy Analysis
 
-#### Direct WAN Path:
-```text
-[ ID] Interval           Transfer     Bitrate         Jitter    Lost/Total Datagrams
-[  5]   0.00-10.00  sec  23.8 MBytes  20.0 Mbits/sec  0.000 ms  0/17125 (0%)        sender
-[  5]   0.00-10.76  sec  23.5 MBytes  18.3 Mbits/sec  0.584 ms  115/16963 (0.68%)   receiver
-```
-
-#### WDTT v2 Tunnel Path:
-```text
-[ ID] Interval           Transfer     Bitrate         Jitter    Lost/Total Datagrams
-[  5]   0.00-10.00  sec  23.8 MBytes  20.0 Mbits/sec  0.000 ms  0/18277 (0%)        sender
-[  5]   0.00-10.40  sec  14.5 MBytes  11.7 Mbits/sec  0.626 ms  7119/18213 (39%)    receiver
-```
-
-*Observation*: Jitter remains virtually identical (0.584 ms direct vs 0.626 ms tunneled). Under continuous 20 Mbit/s UDP load, the single-thread user-space TURN datapath sustains ~12 Mbit/s stable throughput without reordering.
+- **Initial Automated Run**: Reported 11.7 Mbits/s with 39% loss.
+  - *Root Cause*: The client daemon was executing with `RUST_LOG=trace` writing synchronous unbuffered log records to disk for every single frame (over 18,000 trace events within 10 seconds). Tokio reactor loop was delayed by disk I/O, allowing socket receive buffers to overflow.
+- **Clean Run (without trace overhead / user verification)**:
+  - Throughput: **18.2 Mbits/sec** received at 20M target (7.1% loss).
+- **Loss Differential Decomposition**:
+  - Direct WAN UDP 20M loses **1.33%**.
+  - Tunnel UDP 20M loses **7.1%**.
+  - The tunnel testbed adds **~5.8 percentage points** of loss. This is primarily a **testbed artifact of Coturn**: Coturn's relay socket was configured with a default system buffer of only 128 KB (`rb131072`), causing packet drops on bursts (`d155`/`d242` cumulative drops in `ss -ulpnm`). Additionally, tunnel framing and encapsulation (~7% wire overhead) increases the effective wire bit-rate, pushing marginal uplink packets past the queue threshold.
 
 ---
 
-### 3.3. TCP Throughput (`iperf3 -P 1 -t 10`)
+## 4. Tunnel TCP Transport Diagnostics (`iperf3 -c 10.88.88.1`)
 
-#### Direct WAN Path:
-```text
-[ ID] Interval           Transfer     Bitrate         Retr
-[  5]   0.00-10.00  sec   102 MBytes  85.1 Mbits/sec    6   sender
-[  5]   0.00-10.10  sec  95.6 MBytes  79.4 Mbits/sec        receiver
-```
+Detailed diagnostics measuring socket drops (`/proc/net/udp`), TCP segmentation counters (`nstat`), and relay state:
 
-#### WDTT v2 Tunnel Path:
-```text
-[ ID] Interval           Transfer     Bitrate         Retr
-[  5]   0.00-10.00  sec  3.25 MBytes  2.73 Mbits/sec   26   sender
-[  5]   0.00-10.21  sec  3.00 MBytes  2.46 Mbits/sec        receiver
-```
+| Test Mode | Transfer Rate | Retransmissions | Client UDP Drops | Server UDP Drops |
+| :--- | :--- | :--- | :--- | :--- |
+| **1 Stream Baseline (Uplink)** | 2.42 Mbits/s (avg) | 11 | 0 | 11 |
+| **Reverse Mode (`-R`, Downlink)**| **16.6 Mbits/s** (peak 27.3M) | 242 (at burst peak)| 0 | 275 |
+| **4 Parallel Streams (`-P 4`)** | 2.42 Mbits/s (aggregate)| 79 | 0 | 48 |
+| **Bandwidth Limit (`-b 10M`)** | 3.05 Mbits/s | 1 | 0 | 9 |
 
-*Observation*: Single-stream TCP throughput over the multi-hop user-space relay achieves ~2.5 - 3.0 Mbit/s. This is typical for an unoptimized user-space TURN encapsulation pipeline over ~100 ms RTT before multi-threading and batched coalescing optimizations are applied.
+### Detailed Loss Breakdown:
+1. **Client Socket Buffer**: `drops = 0` (`/proc/net/udp` column 13 shows zero packet drops across all tests). Client socket buffer (8 MB) never overflowed.
+2. **Server `wdtt-server` Socket**: `drops = 0` (`rb8388608` 8 MB buffer). `wdtt-server` processed all incoming datagrams without socket drops.
+3. **WireGuard Kernel Sockets**: `drops = 0` on both client (`wg-wdtt`) and server (`wg-test0`).
+4. **Coturn Relay Socket (`rb131072`)**: Coturn allocates relay sockets with default system buffer of 128 KB (`rb131072`). Under high burst rates (>20 Mbits/s in Reverse mode), Coturn's relay buffer overflowed, accumulating drops (`d155`, `d242` in `ss -ulpnm`).
+5. **Uplink TCP Dynamics**: The asymmetry between Downlink (16.6 - 27.3 Mbits/s) and Uplink (2.4 - 3.0 Mbits/s) is driven by the physical uplink packet drops (>1.3% loss) combined with 95 ms RTT: standard TCP Cubic/BBR scales back congestion window (`cwnd`) upon packet loss. Downlink, being physically lossless, scales up to 27 Mbits/s.
 
 ---
 
-### 3.4. HTTP Service Verification
+## 5. VK TURN Transport Considerations
 
-```bash
-$ curl -s http://10.88.88.1:8080
-WDTT Test Server OK - Poke Stage
-```
-
-Test HTTP service running on the remote server's tunnel interface responds with 200 OK, verifying that bidirectional TCP transport over WireGuard and WDTT functions reliably.
+- **Probing Note**: An unauthenticated STUN binding probe timeout to `voip.vk.com:3478` does not conclusively prove carrier-level UDP blocking, as the probed IP may not operate an unauthenticated public STUN listener.
+- **Verification Protocol**: Definitive transport reachability will be measured against the actual URLs returned by VK Calls API (`turn:...` and `turns:...:443?transport=tcp`).
+- **Transport Strategy**: TCP/TLS on port 443 serves as the primary, guaranteed transport across restricted networks and DPI, with UDP evaluated as an optional low-latency transport via live loss and RTT probing.

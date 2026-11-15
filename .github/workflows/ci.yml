@@ -21,6 +21,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - name: Install GTK and WebKit dev packages
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev
       - uses: Swatinem/rust-cache@v2
       - name: Check Formatting
         run: cargo fmt --all -- --check
@@ -53,6 +55,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install GTK and WebKit dev packages
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev
       - uses: Swatinem/rust-cache@v2
       - name: Run Workspace Tests
         run: cargo test --workspace --verbose
@@ -80,9 +84,23 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      - name: Install musl and cross compilers
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev musl-tools gcc-aarch64-linux-gnu
       - uses: Swatinem/rust-cache@v2
       - name: Cargo Check Target
-        run: cargo check --workspace --target ${{ matrix.target }}
+        shell: bash
+        env:
+          CC_aarch64_unknown_linux_musl: aarch64-linux-gnu-gcc
+          CC_x86_64_unknown_linux_musl: musl-gcc
+        run: |
+          if [[ "${{ matrix.target }}" == *"musl"* ]]; then
+            cargo check --workspace --exclude wdtt-gui --target ${{ matrix.target }}
+          else
+            cargo check --workspace --target ${{ matrix.target }}
+          fi
 
   server-musl-build:
     name: Server Static Musl Build (x86_64)

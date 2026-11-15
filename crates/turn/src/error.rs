@@ -41,4 +41,10 @@ pub enum TurnError {
 
     #[error("timeout waiting for TURN response")]
     Timeout,
+
+    #[error("TLS error: {0}")]
+    TlsError(String),
+
+    #[error("transport error: {0}")]
+    Transport(String),
 }

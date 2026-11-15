@@ -20,6 +20,10 @@ struct ServerArgs {
     coalesce_window: Option<Duration>,
     runtime: String,
     workers: usize,
+    listen: Option<SocketAddr>,
+    listen_tls: Option<SocketAddr>,
+    tls_cert: Option<PathBuf>,
+    tls_key: Option<PathBuf>,
 }
 
 impl ServerArgs {
@@ -38,10 +42,44 @@ impl ServerArgs {
             .ok()
             .and_then(|w| w.parse().ok())
             .unwrap_or(2);
+        let mut listen = None;
+        let mut listen_tls = None;
+        let mut tls_cert = None;
+        let mut tls_key = None;
 
         let mut i = 1;
         while i < args.len() {
             match args[i].as_str() {
+                "--listen" => {
+                    i += 1;
+                    listen = Some(
+                        args.get(i)
+                            .ok_or("Missing value for --listen")?
+                            .parse()
+                            .map_err(|e| format!("Invalid --listen address: {e}"))?,
+                    );
+                }
+                "--listen-tls" => {
+                    i += 1;
+                    listen_tls = Some(
+                        args.get(i)
+                            .ok_or("Missing value for --listen-tls")?
+                            .parse()
+                            .map_err(|e| format!("Invalid --listen-tls address: {e}"))?,
+                    );
+                }
+                "--tls-cert" => {
+                    i += 1;
+                    tls_cert = Some(PathBuf::from(
+                        args.get(i).ok_or("Missing value for --tls-cert")?,
+                    ));
+                }
+                "--tls-key" => {
+                    i += 1;
+                    tls_key = Some(PathBuf::from(
+                        args.get(i).ok_or("Missing value for --tls-key")?,
+                    ));
+                }
                 "--turn-server" => {
                     i += 1;
                     turn_server = args
@@ -112,6 +150,10 @@ impl ServerArgs {
                     println!(
                         "Usage: wdtt-server [OPTIONS]\n\n\
                          Options:\n  \
+                           --listen <ADDR:PORT>         Direct UDP listen address (VK / direct mode)\n  \
+                           --listen-tls <ADDR:PORT>     TCP/TLS stream listen address (e.g. 0.0.0.0:443)\n  \
+                           --tls-cert <PATH>            TLS certificate chain (DER) for --listen-tls\n  \
+                           --tls-key <PATH>             TLS private key (PKCS#8 DER) for --listen-tls\n  \
                            --turn-server <ADDR:PORT>    TURN server address (default: 127.0.0.1:3478)\n  \
                            --turn-user <USER>           TURN username (default: user)\n  \
                            --turn-pass <PASS>           TURN password (default: pass)\n  \
@@ -142,6 +184,10 @@ impl ServerArgs {
             coalesce_window,
             runtime,
             workers,
+            listen,
+            listen_tls,
+            tls_cert,
+            tls_key,
         })
     }
 }
@@ -179,13 +225,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn async_main(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
     info!("=== WDTT v2 Server (Stage 3 Standalone) ===");
-    info!("TURN relay server: {}", args.turn_server);
+    if let Some(listen_addr) = args.listen {
+        info!("Server mode: DIRECT UDP / VK listener on {}", listen_addr);
+    } else if args.listen_tls.is_some() {
+        info!("Server mode: STREAM TCP/TLS listener only");
+    } else {
+        info!(
+            "Server mode: TURN client terminating at {}",
+            args.turn_server
+        );
+    }
+    if let Some(addr) = args.listen_tls {
+        info!("Stream TCP/TLS listener on {}", addr);
+    }
     info!("WireGuard endpoint target: {}", args.wg_endpoint);
     info!("Coalesce window: {:?}", args.coalesce_window);
     info!(
         "Tokio runtime: {} (workers: {})",
         args.runtime, args.workers
     );
+
+    let tls_cert_der = match args.tls_cert.as_ref() {
+        Some(path) => Some(
+            tokio::fs::read(path)
+                .await
+                .map_err(|e| format!("Failed to read TLS certificate {:?}: {e}", path))?,
+        ),
+        None => None,
+    };
+    let tls_key_der = match args.tls_key.as_ref() {
+        Some(path) => Some(
+            tokio::fs::read(path)
+                .await
+                .map_err(|e| format!("Failed to read TLS key {:?}: {e}", path))?,
+        ),
+        None => None,
+    };
+    if args.listen_tls.is_some() && (tls_cert_der.is_none() || tls_key_der.is_none()) {
+        return Err("--listen-tls requires both --tls-cert and --tls-key".into());
+    }
 
     let config = TunnelServerConfig {
         turn_server_addr: args.turn_server,
@@ -195,6 +273,10 @@ async fn async_main(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> 
         wg_endpoint_addr: args.wg_endpoint,
         psk: args.psk,
         coalesce_window: args.coalesce_window,
+        direct_listen_addr: args.listen,
+        stream_listen_addr: args.listen_tls,
+        tls_cert_der,
+        tls_key_der,
     };
 
     let mut server = TunnelServer::new(config);

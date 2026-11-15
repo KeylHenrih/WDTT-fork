@@ -26,7 +26,7 @@ repository = "https://github.com/KeylHenrih/WDTT-private"
 # Core utilities
 bytes = "1.10"
 thiserror = "2.0"
-tracing = "0.1"
+tracing = { version = "0.1", features = ["release_max_level_info"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio = { version = "1.43", features = ["full"] }
 socket2 = { version = "0.5", features = ["all"] }

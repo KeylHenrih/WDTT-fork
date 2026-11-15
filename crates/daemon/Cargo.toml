@@ -18,3 +18,4 @@ tokio = { workspace = true }
 wdtt-proto = { workspace = true }
 wdtt-core = { workspace = true }
 wdtt-provider = { workspace = true }
+socket2 = { workspace = true }

@@ -10,9 +10,16 @@ repository.workspace = true
 name = "wdtt-gui"
 path = "src/main.rs"
 
+[[bin]]
+name = "wdtt-captcha-helper"
+path = "src/bin/captcha_helper.rs"
+
 [dependencies]
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-tokio = { workspace = true }
-wdtt-ipc = { workspace = true }
+url = { workspace = true }
+wry = { version = "0.57", features = ["devtools"] }
+tao = "0.37"
+webkit2gtk = { version = "2.0", default-features = false }
+

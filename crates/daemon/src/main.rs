@@ -3,13 +3,18 @@
 #![forbid(unsafe_code)]
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::time::Duration;
 use tokio::sync::watch;
-use tracing::{error, info};
-use wdtt_core::{KeepaliveMode, TunnelClient, TunnelClientConfig};
+use tracing::{error, info, warn};
+use wdtt_core::{KeepaliveMode, TunnelClient, TunnelClientConfig, TurnTransportMode};
+use wdtt_provider::{CaptchaMode, TurnProvider, VkTurnProvider};
+
+const DEFAULT_EARLIEST_VK_TIME: u64 = 1794734520; // 15:22:00 +06:00
 
 struct ClientArgs {
-    turn_server: SocketAddr,
+    turn_server: Option<SocketAddr>,
+    turn_domain: Option<(String, u16)>,
     turn_username: String,
     turn_password: String,
     turn_realm: String,
@@ -20,12 +25,20 @@ struct ClientArgs {
     coalesce_window: Option<Duration>,
     runtime: String,
     workers: usize,
+    turn_transport: TurnTransportMode,
+    turn_sni: Option<String>,
+    vk_hash: Option<String>,
+    vk_cache_path: PathBuf,
+    earliest_time_secs: u64,
+    bind_iface: Option<String>,
+    captcha_mode: CaptchaMode,
 }
 
 impl ClientArgs {
     fn parse_from_env() -> Result<Self, String> {
         let args: Vec<String> = std::env::args().collect();
-        let mut turn_server = "127.0.0.1:3478".parse().unwrap();
+        let mut turn_server = None;
+        let mut turn_domain = None;
         let mut turn_username = "user".to_string();
         let mut turn_password = "pass".to_string();
         let mut turn_realm = "coturn".to_string();
@@ -43,17 +56,39 @@ impl ClientArgs {
             .ok()
             .and_then(|w| w.parse().ok())
             .unwrap_or(2);
+        let mut turn_transport = TurnTransportMode::Udp;
+        let mut turn_sni = None;
+        let mut vk_hash = None;
+        let default_cache = dirs_home().join(".config/wdtt-dev/vk_creds.json");
+        let mut vk_cache_path = default_cache;
+        let mut earliest_time_secs = std::env::var("WDTT_EARLIEST_TIME")
+            .ok()
+            .and_then(|t| t.parse().ok())
+            .unwrap_or(DEFAULT_EARLIEST_VK_TIME);
+        let mut bind_iface = None;
+        let mut captcha_mode = CaptchaMode::Helper;
 
         let mut i = 1;
         while i < args.len() {
             match args[i].as_str() {
                 "--turn-server" => {
                     i += 1;
-                    turn_server = args
-                        .get(i)
-                        .ok_or("Missing value for --turn-server")?
-                        .parse()
-                        .map_err(|e| format!("Invalid --turn-server address: {e}"))?;
+                    let val = args.get(i).ok_or("Missing value for --turn-server")?;
+                    if let Ok(addr) = val.parse::<SocketAddr>() {
+                        turn_server = Some(addr);
+                    } else if let Some((h, p)) = val.rsplit_once(':') {
+                        let port = p
+                            .parse::<u16>()
+                            .map_err(|e| format!("Invalid port in --turn-server: {e}"))?;
+                        turn_domain = Some((h.to_string(), port));
+                        if turn_sni.is_none() {
+                            turn_sni = Some(h.to_string());
+                        }
+                    } else {
+                        return Err(format!(
+                            "Invalid --turn-server format, expected host:port: {val}"
+                        ));
+                    }
                 }
                 "--turn-user" => {
                     i += 1;
@@ -66,6 +101,48 @@ impl ClientArgs {
                 "--turn-realm" => {
                     i += 1;
                     turn_realm = args.get(i).ok_or("Missing value for --turn-realm")?.clone();
+                }
+                "--vk-hash" => {
+                    i += 1;
+                    vk_hash = Some(args.get(i).ok_or("Missing value for --vk-hash")?.clone());
+                }
+                "--vk-link" => {
+                    i += 1;
+                    let val = args.get(i).ok_or("Missing value for --vk-link")?;
+                    let content = if std::path::Path::new(val).exists() {
+                        std::fs::read_to_string(val)
+                            .map_err(|e| format!("Failed to read vk link file {val}: {e}"))?
+                    } else {
+                        val.clone()
+                    };
+                    // Extract hash from qwdtt link (hashes=...) or direct join link
+                    if let Some(pos) = content.find("hashes=") {
+                        let sub = &content[(pos + 7)..];
+                        let end = sub.find('&').unwrap_or(sub.len());
+                        let first_hash = sub[..end].split(',').next().unwrap_or("").trim();
+                        if !first_hash.is_empty() {
+                            vk_hash = Some(first_hash.to_string());
+                        }
+                    } else if let Some(pos) = content.rfind("/join/") {
+                        let sub = &content[(pos + 6)..];
+                        let end = sub.find('&').or_else(|| sub.find('?')).unwrap_or(sub.len());
+                        vk_hash = Some(sub[..end].trim().to_string());
+                    } else {
+                        vk_hash = Some(content.trim().to_string());
+                    }
+                }
+                "--vk-cache" => {
+                    i += 1;
+                    vk_cache_path =
+                        PathBuf::from(args.get(i).ok_or("Missing value for --vk-cache")?);
+                }
+                "--earliest-time" => {
+                    i += 1;
+                    earliest_time_secs = args
+                        .get(i)
+                        .ok_or("Missing value for --earliest-time")?
+                        .parse()
+                        .map_err(|e| format!("Invalid --earliest-time epoch: {e}"))?;
                 }
                 "--server-relayed" => {
                     i += 1;
@@ -142,6 +219,25 @@ impl ClientArgs {
                         None
                     };
                 }
+                "--transport" => {
+                    i += 1;
+                    let val = args.get(i).ok_or("Missing value for --transport")?;
+                    turn_transport = match val.to_lowercase().as_str() {
+                        "udp" => TurnTransportMode::Udp,
+                        "tcp" => TurnTransportMode::Tcp,
+                        "tls" => TurnTransportMode::Tls,
+                        "auto" => TurnTransportMode::Auto,
+                        other => {
+                            return Err(format!(
+                                "Unknown transport '{other}', expected: udp, tcp, tls, auto"
+                            ));
+                        }
+                    };
+                }
+                "--sni" => {
+                    i += 1;
+                    turn_sni = Some(args.get(i).ok_or("Missing value for --sni")?.clone());
+                }
                 "--runtime" => {
                     i += 1;
                     runtime = args.get(i).ok_or("Missing value for --runtime")?.clone();
@@ -154,6 +250,18 @@ impl ClientArgs {
                         .parse()
                         .map_err(|e| format!("Invalid worker count: {e}"))?;
                 }
+                "--bind-iface" => {
+                    i += 1;
+                    bind_iface = Some(args.get(i).ok_or("Missing value for --bind-iface")?.clone());
+                }
+                "--captcha-mode" => {
+                    i += 1;
+                    let val = args.get(i).ok_or("Missing value for --captcha-mode")?;
+                    captcha_mode = match val.to_lowercase().as_str() {
+                        "manual" => CaptchaMode::Manual,
+                        _ => CaptchaMode::Helper,
+                    };
+                }
                 "-h" | "--help" => {
                     println!(
                         "Usage: wdttd [OPTIONS] --server-relayed <ADDR:PORT>\n\n\
@@ -162,10 +270,20 @@ impl ClientArgs {
                            --turn-user <USER>              TURN username (default: user)\n  \
                            --turn-pass <PASS>              TURN password (default: pass)\n  \
                            --turn-realm <REALM>            TURN realm (default: coturn)\n  \
+                           --transport <MODE>              TURN transport: udp (default), tcp, tls, auto\n  \
+                           --sni <HOST>                    SNI hostname for TLS verification\n  \
+                           --bind-iface <IFACE>            Bind outbound sockets to a network interface\n  \
                            --server-relayed <ADDR:PORT>    Remote server relayed address on TURN (required)\n  \
                            --wg-listen <ADDR:PORT>         Local WireGuard listening port (default: 127.0.0.1:51821)\n  \
                            --psk <STRING>                  Pre-shared key for knock authentication\n  \
                            --keepalive <MODE>              Keepalive mode: powersave (default), chaff, disabled\n  \
+                           --coalesce-ms <MS>              Coalesce window for outbound datagrams (0 = off)\n  \
+                           --profile <NAME>                Provider profile (default: vk)\n  \
+                           --vk-hash <HASH>                VK call hash (alternative to --vk-link)\n  \
+                           --vk-link <URL>                 VK call join link\n  \
+                           --vk-cache <PATH>               Path to the VK credential cache file\n  \
+                           --earliest-time <EPOCH>         Earliest acceptable VK credential timestamp\n  \
+                           --captcha-mode <MODE>           Captcha solving: manual (default), auto, disabled\n  \
                            --runtime <MODE>                Tokio runtime: multi_thread (default), current_thread\n  \
                            --workers <N>                   Worker threads for multi_thread runtime (default: 2)\n"
                     );
@@ -183,6 +301,7 @@ impl ClientArgs {
 
         Ok(Self {
             turn_server,
+            turn_domain,
             turn_username,
             turn_password,
             turn_realm,
@@ -193,8 +312,21 @@ impl ClientArgs {
             coalesce_window,
             runtime,
             workers,
+            turn_transport,
+            turn_sni,
+            vk_hash,
+            vk_cache_path,
+            earliest_time_secs,
+            bind_iface,
+            captcha_mode,
         })
     }
+}
+
+fn dirs_home() -> PathBuf {
+    std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."))
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -228,20 +360,78 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     rt.block_on(async_main(args))
 }
 
-async fn async_main(args: ClientArgs) -> Result<(), Box<dyn std::error::Error>> {
-    info!("=== WDTT v2 Client Daemon (Stage 3 Standalone) ===");
-    info!("TURN relay server: {}", args.turn_server);
+async fn async_main(mut args: ClientArgs) -> Result<(), Box<dyn std::error::Error>> {
+    info!("=== WDTT v2 Client Daemon (Stage 5 VK/TURN M2) ===");
+
+    // If VK Hash or Link is configured, acquire TURN credentials via VkTurnProvider
+    if let Some(ref hash) = args.vk_hash {
+        info!("Initializing VK Calls TURN credential provider (hash: {hash})...");
+        let provider =
+            VkTurnProvider::new(hash, args.vk_cache_path.clone(), args.earliest_time_secs)
+                .with_bind_interface(args.bind_iface.clone())
+                .with_captcha_mode(args.captcha_mode);
+        let creds = provider.acquire_credentials().await?;
+
+        args.turn_username = creds.username;
+        args.turn_password = creds.password;
+        args.turn_realm = creds.realm;
+        args.turn_sni = Some(creds.host.clone());
+        if args.turn_transport == TurnTransportMode::Udp && !creds.use_udp {
+            args.turn_transport = TurnTransportMode::Tls;
+        }
+
+        let port = if (args.turn_transport == TurnTransportMode::Tls
+            || args.turn_transport == TurnTransportMode::Tcp)
+            && creds.port == 3478
+        {
+            443
+        } else {
+            creds.port
+        };
+
+        let resolved = tokio::net::lookup_host(format!("{}:{}", creds.host, port))
+            .await
+            .map_err(|e| format!("Failed to resolve TURN host {}: {e}", creds.host))?
+            .next()
+            .ok_or_else(|| format!("No IP addresses found for TURN host {}", creds.host))?;
+
+        args.turn_server = Some(resolved);
+        info!("Resolved VK TURN server {} -> {resolved}", creds.host);
+
+        // Check UDP reachability to VK TURN (port 3478)
+        check_vk_turn_udp(&creds.host, args.bind_iface.as_deref()).await;
+    } else if let Some((ref domain, port)) = args.turn_domain
+        && args.turn_server.is_none()
+    {
+        let resolved = tokio::net::lookup_host(format!("{domain}:{port}"))
+            .await
+            .map_err(|e| format!("Failed to resolve TURN host {domain}: {e}"))?
+            .next()
+            .ok_or_else(|| format!("No IP addresses found for TURN host {domain}"))?;
+        args.turn_server = Some(resolved);
+        info!("Resolved TURN domain {domain} -> {resolved}");
+    }
+
+    let turn_server = args
+        .turn_server
+        .unwrap_or_else(|| "127.0.0.1:3478".parse().unwrap());
+
+    info!("TURN relay server: {}", turn_server);
     info!("Server relayed target: {}", args.server_relayed);
     info!("WireGuard bridge listen port: {}", args.wg_listen);
     info!("Keepalive mode: {:?}", args.keepalive_mode);
     info!("Coalesce window: {:?}", args.coalesce_window);
+    info!("TURN transport: {:?}", args.turn_transport);
+    if let Some(ref sni) = args.turn_sni {
+        info!("TLS SNI: {}", sni);
+    }
     info!(
         "Tokio runtime: {} (workers: {})",
         args.runtime, args.workers
     );
 
     let config = TunnelClientConfig {
-        turn_server_addr: args.turn_server,
+        turn_server_addr: turn_server,
         turn_username: args.turn_username,
         turn_password: args.turn_password,
         turn_realm: args.turn_realm,
@@ -250,6 +440,10 @@ async fn async_main(args: ClientArgs) -> Result<(), Box<dyn std::error::Error>> 
         psk: args.psk,
         keepalive_mode: args.keepalive_mode,
         coalesce_window: args.coalesce_window,
+        turn_transport: args.turn_transport,
+        turn_sni: args.turn_sni,
+        custom_ca_der: None,
+        bind_interface: args.bind_iface,
     };
 
     let mut client = TunnelClient::new(config);
@@ -302,4 +496,86 @@ async fn async_main(args: ClientArgs) -> Result<(), Box<dyn std::error::Error>> 
     );
 
     Ok(())
+}
+
+async fn check_vk_turn_udp(host: &str, bind_iface: Option<&str>) {
+    info!("Testing UDP reachability to VK TURN server {host}:3478 (bind_iface: {bind_iface:?})...");
+    let Ok(mut addrs) = tokio::net::lookup_host(format!("{host}:3478")).await else {
+        warn!("Failed to resolve UDP endpoint {host}:3478");
+        return;
+    };
+    let Some(udp_addr) = addrs.next() else {
+        warn!("No IP for UDP endpoint {host}:3478");
+        return;
+    };
+
+    let sock2 = match socket2::Socket::new(
+        socket2::Domain::IPV4,
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("Failed to create UDP socket for STUN check: {e}");
+            return;
+        }
+    };
+
+    #[cfg(target_os = "linux")]
+    if let Some(iface) = bind_iface
+        && let Err(e) = sock2.bind_device(Some(iface.as_bytes()))
+    {
+        warn!("Failed to bind UDP socket to interface {iface}: {e}");
+        return;
+    }
+    let _ = sock2.set_nonblocking(true);
+    let _ = sock2.bind(&"0.0.0.0:0".parse::<SocketAddr>().unwrap().into());
+    let Ok(sock) = tokio::net::UdpSocket::from_std(sock2.into()) else {
+        warn!("Failed to convert std UDP socket to tokio");
+        return;
+    };
+
+    // Standard STUN Binding Request (RFC 5389): 20 bytes
+    let mut req = [0u8; 20];
+    req[0] = 0x00;
+    req[1] = 0x01; // Binding Request
+    req[2] = 0x00;
+    req[3] = 0x00; // Message Length = 0
+    req[4] = 0x21;
+    req[5] = 0x12;
+    req[6] = 0xa4;
+    req[7] = 0x42; // Magic Cookie
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let bytes = nanos.to_le_bytes();
+    req[8..20].copy_from_slice(&bytes[..12]);
+
+    if let Err(e) = sock.send_to(&req, udp_addr).await {
+        warn!("Failed to send STUN Binding Request to {udp_addr}: {e}");
+        return;
+    }
+
+    let mut resp = [0u8; 512];
+    let res = tokio::time::timeout(Duration::from_millis(1500), sock.recv_from(&mut resp)).await;
+    match res {
+        Ok(Ok((len, src))) => {
+            if len >= 20 && resp[0] == 0x01 && resp[1] == 0x01 {
+                info!(
+                    "VK TURN UDP reachability: SUCCESS (STUN Binding Response from {src}, {len} bytes). UDP is OPEN and usable."
+                );
+            } else {
+                info!("VK TURN UDP reachability: received {len} bytes from {src}.");
+            }
+        }
+        Ok(Err(e)) => {
+            warn!("VK TURN UDP socket receive error: {e}");
+        }
+        Err(_) => {
+            info!(
+                "VK TURN UDP reachability: TIMEOUT (1500ms) to {udp_addr}. UDP is blocked/filtered by ISP or NAT."
+            );
+        }
+    }
 }

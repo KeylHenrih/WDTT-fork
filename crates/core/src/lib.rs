@@ -14,11 +14,13 @@ pub use batch::{
 pub use keepalive::{AdaptiveKeepalive, AdaptiveKeepaliveConfig, KeepaliveNetworkCache, NetworkId};
 pub use metrics::{MetricsSnapshot, TunnelMetrics};
 pub use tunnel::{
-    KeepaliveMode, TunnelClient, TunnelClientConfig, TunnelError, TunnelServer, TunnelServerConfig,
+    DirectSessionWorker, KeepaliveMode, StreamSessionWorker, TunnelClient, TunnelClientConfig,
+    TunnelError, TunnelServer, TunnelServerConfig,
 };
+pub use wdtt_turn::TurnTransportMode;
 
-/// Default MTU for WDTT v2 WireGuard inner tunnel interface.
-pub const DEFAULT_TUNNEL_MTU: u16 = 1200;
+/// Default MTU for WDTT v2 WireGuard inner tunnel interface (1360 prevents fragmentation on 1492 PPPoE WANs).
+pub const DEFAULT_TUNNEL_MTU: u16 = 1360;
 
 /// Maximum number of active streams allocated per single call join hash.
 pub const MAX_STREAMS_PER_HASH: usize = 8;
@@ -61,6 +63,10 @@ mod tests {
             wg_endpoint_addr: server_wg_addr,
             psk,
             coalesce_window: None,
+            direct_listen_addr: None,
+            stream_listen_addr: None,
+            tls_cert_der: None,
+            tls_key_der: None,
         };
 
         let (server_cancel_tx, server_cancel_rx) = watch::channel(false);
@@ -118,6 +124,10 @@ mod tests {
             wg_endpoint_addr: server_wg_addr,
             psk,
             coalesce_window: None,
+            direct_listen_addr: None,
+            stream_listen_addr: None,
+            tls_cert_der: None,
+            tls_key_der: None,
         };
         let mut server = TunnelServer::new(server_cfg);
         let server_metrics = server.metrics();
@@ -143,6 +153,10 @@ mod tests {
             psk,
             keepalive_mode: KeepaliveMode::Chaff,
             coalesce_window: None,
+            turn_transport: TurnTransportMode::Udp,
+            turn_sni: None,
+            custom_ca_der: None,
+            bind_interface: None,
         };
         let mut client = TunnelClient::new(client_cfg);
         let client_metrics = client.metrics();
@@ -232,7 +246,7 @@ mod tests {
 
     #[test]
     fn test_core_limits() {
-        assert_eq!(DEFAULT_TUNNEL_MTU, 1200);
+        assert_eq!(DEFAULT_TUNNEL_MTU, 1360);
         assert_eq!(MAX_STREAMS_PER_HASH, 8);
         assert_eq!(MIN_STREAMS, 2);
     }
