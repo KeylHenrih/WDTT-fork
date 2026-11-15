@@ -17,5 +17,4 @@ tracing-subscriber = { workspace = true }
 tokio = { workspace = true }
 wdtt-proto = { workspace = true }
 wdtt-core = { workspace = true }
-wdtt-tun = { workspace = true }
-wdtt-ipc = { workspace = true }
+wdtt-provider = { workspace = true }

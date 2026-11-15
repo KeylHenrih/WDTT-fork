@@ -1458,9 +1458,8 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "wdtt-core",
- "wdtt-ipc",
  "wdtt-proto",
- "wdtt-tun",
+ "wdtt-provider",
 ]
 
 [[package]]

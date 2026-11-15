@@ -281,9 +281,18 @@ impl TunnelClient {
         info!("Client bound peer {}", self.config.server_relayed_addr);
 
         // Derive dynamic refresh intervals from negotiated TURN LIFETIME
-        let mut alloc_refresh_timer = interval(turn_client.allocation_refresh_interval());
-        let mut perm_refresh_timer = interval(turn_client.permission_refresh_interval());
-        let mut chan_bind_refresh_timer = interval(turn_client.channel_bind_refresh_interval());
+        let mut alloc_refresh_timer = tokio::time::interval_at(
+            tokio::time::Instant::now() + turn_client.allocation_refresh_interval(),
+            turn_client.allocation_refresh_interval(),
+        );
+        let mut perm_refresh_timer = tokio::time::interval_at(
+            tokio::time::Instant::now() + turn_client.permission_refresh_interval(),
+            turn_client.permission_refresh_interval(),
+        );
+        let mut chan_bind_refresh_timer = tokio::time::interval_at(
+            tokio::time::Instant::now() + turn_client.channel_bind_refresh_interval(),
+            turn_client.channel_bind_refresh_interval(),
+        );
 
         // Send Pre-Auth Knock
         let knock_key = derive_pre_auth_knock_key(&Psk::from_bytes(self.config.psk));
@@ -1025,9 +1034,18 @@ impl TunnelServer {
         }
 
         // Derive dynamic refresh intervals from negotiated TURN LIFETIME
-        let mut alloc_refresh_timer = interval(turn_client.allocation_refresh_interval());
-        let mut perm_refresh_timer = interval(turn_client.permission_refresh_interval());
-        let mut chan_bind_refresh_timer = interval(turn_client.channel_bind_refresh_interval());
+        let mut alloc_refresh_timer = tokio::time::interval_at(
+            tokio::time::Instant::now() + turn_client.allocation_refresh_interval(),
+            turn_client.allocation_refresh_interval(),
+        );
+        let mut perm_refresh_timer = tokio::time::interval_at(
+            tokio::time::Instant::now() + turn_client.permission_refresh_interval(),
+            turn_client.permission_refresh_interval(),
+        );
+        let mut chan_bind_refresh_timer = tokio::time::interval_at(
+            tokio::time::Instant::now() + turn_client.channel_bind_refresh_interval(),
+            turn_client.channel_bind_refresh_interval(),
+        );
 
         let batched_turn = Arc::new(BatchedUdpSocket::new(turn_client.socket().clone()));
 

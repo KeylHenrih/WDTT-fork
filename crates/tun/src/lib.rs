@@ -5,6 +5,17 @@
 
 #![deny(missing_docs)]
 
+/// Virtual packet buffer type for TUN payload exchange.
+pub type TunPacket = bytes::Bytes;
+
+/// Errors produced during TUN device initialization or frame processing.
+#[derive(Debug, thiserror::Error)]
+pub enum TunError {
+    /// Device I/O failure.
+    #[error("TUN device I/O error: {0}")]
+    Io(#[from] std::io::Error),
+}
+
 /// Common configuration parameters for creating a virtual TUN interface.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TunConfig {

@@ -49,47 +49,55 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             })
         }
         "forward-asyncfd" => {
-            if args.len() < 4 {
-                eprintln!(
-                    "Usage: forwarder-baseline forward-asyncfd <LISTEN> <TARGET> [current_thread|multi_thread]"
-                );
+            #[cfg(unix)]
+            {
+                if args.len() < 4 {
+                    eprintln!(
+                        "Usage: forwarder-baseline forward-asyncfd <LISTEN> <TARGET> [current_thread|multi_thread]"
+                    );
+                    std::process::exit(1);
+                }
+                let listen_addr: SocketAddr = args[2].parse()?;
+                let target_addr: SocketAddr = args[3].parse()?;
+                let runtime = args.get(4).map(|s| s.as_str()).unwrap_or("current_thread");
+
+                let rt = if runtime == "current_thread" {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()?
+                } else {
+                    tokio::runtime::Builder::new_multi_thread()
+                        .worker_threads(2)
+                        .enable_all()
+                        .build()?
+                };
+
+                rt.block_on(async move {
+                    let std_sock = std::net::UdpSocket::bind(listen_addr)?;
+                    std_sock.set_nonblocking(true)?;
+                    #[allow(deprecated)]
+                    let async_fd = tokio::io::unix::AsyncFd::with_interest(
+                        std_sock,
+                        tokio::io::Interest::READABLE,
+                    )?;
+                    let mut buf = [0u8; 2048];
+                    loop {
+                        let mut guard = async_fd.readable().await?;
+                        match guard.try_io(|inner| inner.get_ref().recv_from(&mut buf)) {
+                            Ok(Ok((len, _src))) => {
+                                let _ = async_fd.get_ref().send_to(&buf[..len], target_addr);
+                            }
+                            Ok(Err(e)) => return Err(e.into()),
+                            Err(_would_block) => continue,
+                        }
+                    }
+                })
+            }
+            #[cfg(not(unix))]
+            {
+                eprintln!("forward-asyncfd is only supported on Unix targets");
                 std::process::exit(1);
             }
-            let listen_addr: SocketAddr = args[2].parse()?;
-            let target_addr: SocketAddr = args[3].parse()?;
-            let runtime = args.get(4).map(|s| s.as_str()).unwrap_or("current_thread");
-
-            let rt = if runtime == "current_thread" {
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()?
-            } else {
-                tokio::runtime::Builder::new_multi_thread()
-                    .worker_threads(2)
-                    .enable_all()
-                    .build()?
-            };
-
-            rt.block_on(async move {
-                let std_sock = std::net::UdpSocket::bind(listen_addr)?;
-                std_sock.set_nonblocking(true)?;
-                #[allow(deprecated)]
-                let async_fd = tokio::io::unix::AsyncFd::with_interest(
-                    std_sock,
-                    tokio::io::Interest::READABLE,
-                )?;
-                let mut buf = [0u8; 2048];
-                loop {
-                    let mut guard = async_fd.readable().await?;
-                    match guard.try_io(|inner| inner.get_ref().recv_from(&mut buf)) {
-                        Ok(Ok((len, _src))) => {
-                            let _ = async_fd.get_ref().send_to(&buf[..len], target_addr);
-                        }
-                        Ok(Err(e)) => return Err(e.into()),
-                        Err(_would_block) => continue,
-                    }
-                }
-            })
         }
         "sink" => {
             if args.len() < 3 {
