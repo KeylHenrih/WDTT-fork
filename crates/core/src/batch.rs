@@ -243,7 +243,6 @@ impl BatchedUdpSocket {
         let res = self
             .socket
             .async_io(Interest::READABLE, || {
-
                 let mut hdrs: Vec<libc::mmsghdr> = Vec::with_capacity(batch_size);
                 let mut iovecs: Vec<libc::iovec> = Vec::with_capacity(batch_size);
                 let mut addrs: Vec<libc::sockaddr_storage> = Vec::with_capacity(batch_size);
@@ -337,9 +336,9 @@ impl BatchedUdpSocket {
         // Explicitly clear Tokio's readiness flag so that the subsequent iteration does NOT
         // issue a doomed recvmmsg syscall that returns EAGAIN/WouldBlock.
         if res < batch_size && !self.caps.disable_short_batch_clear {
-            let _: io::Result<()> = self
-                .socket
-                .try_io(Interest::READABLE, || Err(io::Error::from(io::ErrorKind::WouldBlock)));
+            let _: io::Result<()> = self.socket.try_io(Interest::READABLE, || {
+                Err(io::Error::from(io::ErrorKind::WouldBlock))
+            });
         }
 
         Ok(res)
@@ -684,7 +683,7 @@ mod tests {
         // Verify packet 2 is received without losing epoll wakeup!
         let n2 = tokio::time::timeout(
             Duration::from_millis(200),
-            batched.recv_batch(&mut bufs, &mut metas)
+            batched.recv_batch(&mut bufs, &mut metas),
         )
         .await
         .expect("Must not deadlock or lose wakeup")

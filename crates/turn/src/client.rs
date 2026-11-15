@@ -158,11 +158,16 @@ impl TurnClient {
 
     /// Update target peer and establish permission and channel binding.
     pub async fn bind_peer(&mut self, peer_addr: SocketAddr) -> Result<(), TurnError> {
-        self.bind_peer_channel(peer_addr, self.config.channel_number).await
+        self.bind_peer_channel(peer_addr, self.config.channel_number)
+            .await
     }
 
     /// Update target peer and establish permission and channel binding to a specific channel number.
-    pub async fn bind_peer_channel(&mut self, peer_addr: SocketAddr, channel_number: u16) -> Result<(), TurnError> {
+    pub async fn bind_peer_channel(
+        &mut self,
+        peer_addr: SocketAddr,
+        channel_number: u16,
+    ) -> Result<(), TurnError> {
         self.config.peer_addr = peer_addr;
         self.create_permission_internal().await?;
         self.channel_bind_custom(peer_addr, channel_number).await?;
@@ -280,11 +285,16 @@ impl TurnClient {
 
     /// Send a data packet encapsulated in a TURN ChannelData message to the relay.
     pub async fn send_channel_data(&self, payload: &[u8]) -> Result<(), TurnError> {
-        self.send_channel_data_to(self.config.channel_number, payload).await
+        self.send_channel_data_to(self.config.channel_number, payload)
+            .await
     }
 
     /// Send a data packet encapsulated in a TURN ChannelData message on a specific channel.
-    pub async fn send_channel_data_to(&self, channel: u16, payload: &[u8]) -> Result<(), TurnError> {
+    pub async fn send_channel_data_to(
+        &self,
+        channel: u16,
+        payload: &[u8],
+    ) -> Result<(), TurnError> {
         let mut buf = BytesMut::new();
         encode_channel_data(channel, payload, false, &mut buf)?;
         self.socket.send_to(&buf, self.config.server_addr).await?;
@@ -415,11 +425,16 @@ impl TurnClient {
     }
 
     async fn channel_bind_internal(&mut self) -> Result<(), TurnError> {
-        self.channel_bind_custom(self.config.peer_addr, self.config.channel_number).await
+        self.channel_bind_custom(self.config.peer_addr, self.config.channel_number)
+            .await
     }
 
     /// Perform authenticated ChannelBind for specified peer address and channel number.
-    pub async fn channel_bind_custom(&mut self, peer_addr: SocketAddr, channel_number: u16) -> Result<(), TurnError> {
+    pub async fn channel_bind_custom(
+        &mut self,
+        peer_addr: SocketAddr,
+        channel_number: u16,
+    ) -> Result<(), TurnError> {
         let mut tx_id = [0u8; 12];
         rand::rng().fill_bytes(&mut tx_id);
 

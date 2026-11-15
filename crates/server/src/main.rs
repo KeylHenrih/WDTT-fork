@@ -90,7 +90,11 @@ impl ServerArgs {
                         .ok_or("Missing value for --coalesce-ms")?
                         .parse()
                         .map_err(|e| format!("Invalid --coalesce-ms value: {e}"))?;
-                    coalesce_window = if ms > 0 { Some(Duration::from_millis(ms)) } else { None };
+                    coalesce_window = if ms > 0 {
+                        Some(Duration::from_millis(ms))
+                    } else {
+                        None
+                    };
                 }
                 "--runtime" => {
                     i += 1;
@@ -172,7 +176,10 @@ async fn async_main(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> 
     info!("TURN relay server: {}", args.turn_server);
     info!("WireGuard endpoint target: {}", args.wg_endpoint);
     info!("Coalesce window: {:?}", args.coalesce_window);
-    info!("Tokio runtime: {} (workers: {})", args.runtime, args.workers);
+    info!(
+        "Tokio runtime: {} (workers: {})",
+        args.runtime, args.workers
+    );
 
     let config = TunnelServerConfig {
         turn_server_addr: args.turn_server,
@@ -226,8 +233,14 @@ async fn async_main(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> 
     let snap = metrics.snapshot();
     info!(
         "Final Metrics: TX packets={} bytes={} | RX packets={} bytes={} | batches single={} multi={} | pings tx={} rx={}",
-        snap.packets_tx, snap.bytes_tx, snap.packets_rx, snap.bytes_rx,
-        snap.batches_single, snap.batches_multi, snap.pings_tx, snap.pings_rx
+        snap.packets_tx,
+        snap.bytes_tx,
+        snap.packets_rx,
+        snap.bytes_rx,
+        snap.batches_single,
+        snap.batches_multi,
+        snap.pings_tx,
+        snap.pings_rx
     );
 
     Ok(())

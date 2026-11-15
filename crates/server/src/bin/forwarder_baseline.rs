@@ -19,7 +19,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     match args[1].as_str() {
         "forward" => {
             if args.len() < 4 {
-                eprintln!("Usage: forwarder-baseline forward <LISTEN> <TARGET> [current_thread|multi_thread]");
+                eprintln!(
+                    "Usage: forwarder-baseline forward <LISTEN> <TARGET> [current_thread|multi_thread]"
+                );
                 std::process::exit(1);
             }
             let listen_addr: SocketAddr = args[2].parse()?;
@@ -48,7 +50,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         "forward-asyncfd" => {
             if args.len() < 4 {
-                eprintln!("Usage: forwarder-baseline forward-asyncfd <LISTEN> <TARGET> [current_thread|multi_thread]");
+                eprintln!(
+                    "Usage: forwarder-baseline forward-asyncfd <LISTEN> <TARGET> [current_thread|multi_thread]"
+                );
                 std::process::exit(1);
             }
             let listen_addr: SocketAddr = args[2].parse()?;
@@ -70,7 +74,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let std_sock = std::net::UdpSocket::bind(listen_addr)?;
                 std_sock.set_nonblocking(true)?;
                 #[allow(deprecated)]
-                let async_fd = tokio::io::unix::AsyncFd::with_interest(std_sock, tokio::io::Interest::READABLE)?;
+                let async_fd = tokio::io::unix::AsyncFd::with_interest(
+                    std_sock,
+                    tokio::io::Interest::READABLE,
+                )?;
                 let mut buf = [0u8; 2048];
                 loop {
                     let mut guard = async_fd.readable().await?;
@@ -103,7 +110,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let (len, _) = sock.recv_from(&mut buf).await?;
                     count += 1;
                     bytes += len as u64;
-                    if count % 2000 == 0 {
+                    if count.is_multiple_of(2000) {
                         let elapsed = start.elapsed().as_secs_f64();
                         let pps = count as f64 / elapsed;
                         let mbps = (bytes * 8) as f64 / (elapsed * 1e6);

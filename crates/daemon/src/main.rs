@@ -99,7 +99,11 @@ impl ClientArgs {
                         "chaff" => KeepaliveMode::Chaff,
                         "disabled" => KeepaliveMode::Disabled,
                         "powersave" => KeepaliveMode::PowerSave,
-                        other => return Err(format!("Unknown keepalive mode '{other}', expected: powersave, chaff, disabled")),
+                        other => {
+                            return Err(format!(
+                                "Unknown keepalive mode '{other}', expected: powersave, chaff, disabled"
+                            ));
+                        }
                     };
                 }
                 "--profile" => {
@@ -118,7 +122,11 @@ impl ClientArgs {
                             keepalive_mode = KeepaliveMode::Chaff;
                             coalesce_window = None;
                         }
-                        other => return Err(format!("Unknown profile '{other}', expected: powersave, performance, chaff")),
+                        other => {
+                            return Err(format!(
+                                "Unknown profile '{other}', expected: powersave, performance, chaff"
+                            ));
+                        }
                     }
                 }
                 "--coalesce-ms" => {
@@ -128,7 +136,11 @@ impl ClientArgs {
                         .ok_or("Missing value for --coalesce-ms")?
                         .parse()
                         .map_err(|e| format!("Invalid --coalesce-ms value: {e}"))?;
-                    coalesce_window = if ms > 0 { Some(Duration::from_millis(ms)) } else { None };
+                    coalesce_window = if ms > 0 {
+                        Some(Duration::from_millis(ms))
+                    } else {
+                        None
+                    };
                 }
                 "--runtime" => {
                     i += 1;
@@ -217,7 +229,10 @@ async fn async_main(args: ClientArgs) -> Result<(), Box<dyn std::error::Error>> 
     info!("WireGuard bridge listen port: {}", args.wg_listen);
     info!("Keepalive mode: {:?}", args.keepalive_mode);
     info!("Coalesce window: {:?}", args.coalesce_window);
-    info!("Tokio runtime: {} (workers: {})", args.runtime, args.workers);
+    info!(
+        "Tokio runtime: {} (workers: {})",
+        args.runtime, args.workers
+    );
 
     let config = TunnelClientConfig {
         turn_server_addr: args.turn_server,
@@ -269,8 +284,15 @@ async fn async_main(args: ClientArgs) -> Result<(), Box<dyn std::error::Error>> 
     let snap = metrics.snapshot();
     info!(
         "Final Metrics: TX packets={} bytes={} | RX packets={} bytes={} | batches single={} multi={} | pings tx={} rx={} | RTT={}ms",
-        snap.packets_tx, snap.bytes_tx, snap.packets_rx, snap.bytes_rx,
-        snap.batches_single, snap.batches_multi, snap.pings_tx, snap.pings_rx, snap.rtt_latest_ms
+        snap.packets_tx,
+        snap.bytes_tx,
+        snap.packets_rx,
+        snap.bytes_rx,
+        snap.batches_single,
+        snap.batches_multi,
+        snap.pings_tx,
+        snap.pings_rx,
+        snap.rtt_latest_ms
     );
 
     Ok(())

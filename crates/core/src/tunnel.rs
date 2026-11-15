@@ -19,12 +19,10 @@ use wdtt_crypto::{
     CryptoError, DEFAULT_MAX_CLOCK_SKEW_SEC, KnockAuthenticator, Psk, derive_pre_auth_knock_key,
 };
 use wdtt_proto::{
-    flags, FrameType, FrameView, PingPayload, PongPayload, ProtoError, WgResequencer, encode_frame,
+    FrameType, FrameView, PingPayload, PongPayload, ProtoError, WgResequencer, encode_frame, flags,
     inspect_wg_packet,
 };
-use wdtt_turn::{
-    encode_channel_data, TurnClient, TurnClientConfig, TurnError, TurnIncoming,
-};
+use wdtt_turn::{TurnClient, TurnClientConfig, TurnError, TurnIncoming, encode_channel_data};
 
 const RESEQUENCER_TICK_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_PACKET_LEN: usize = 2048;
@@ -888,12 +886,12 @@ impl SessionWorker {
                                 let _ = batched_wg.send_batch(&pkts).await;
                                 pending_wg_frames.clear();
                                 coalesce_wg_deadline = None;
-                            } else if coalesce_wg_deadline.is_none() {
-                                if let Some(window) = adaptive_coalescer.window() {
-                                    let d = tokio::time::Instant::now() + window;
-                                    coalesce_wg_deadline = Some(d);
-                                    coalesce_wg_sleep.as_mut().reset(d);
-                                }
+                            } else if coalesce_wg_deadline.is_none()
+                                && let Some(window) = adaptive_coalescer.window()
+                            {
+                                let d = tokio::time::Instant::now() + window;
+                                coalesce_wg_deadline = Some(d);
+                                coalesce_wg_sleep.as_mut().reset(d);
                             }
                         }
                     }
@@ -930,12 +928,12 @@ impl SessionWorker {
                                     let _ = self.batched_turn.send_batch(&pkts).await;
                                     pending_turn_frames.clear();
                                     coalesce_turn_deadline = None;
-                                } else if coalesce_turn_deadline.is_none() {
-                                    if let Some(window) = adaptive_coalescer.window() {
-                                        let d = tokio::time::Instant::now() + window;
-                                        coalesce_turn_deadline = Some(d);
-                                        coalesce_turn_sleep.as_mut().reset(d);
-                                    }
+                                } else if coalesce_turn_deadline.is_none()
+                                    && let Some(window) = adaptive_coalescer.window()
+                                {
+                                    let d = tokio::time::Instant::now() + window;
+                                    coalesce_turn_deadline = Some(d);
+                                    coalesce_turn_sleep.as_mut().reset(d);
                                 }
                             }
                         }
@@ -949,11 +947,14 @@ impl SessionWorker {
 
         // Flush any remaining buffered packets before exit
         if !pending_turn_frames.is_empty() {
-            let pkts: Vec<TransmitPacket> = pending_turn_frames.iter().map(|b| TransmitPacket {
-                buf: b,
-                addr: self.turn_server_addr,
-                gso_segment_size: None,
-            }).collect();
+            let pkts: Vec<TransmitPacket> = pending_turn_frames
+                .iter()
+                .map(|b| TransmitPacket {
+                    buf: b,
+                    addr: self.turn_server_addr,
+                    gso_segment_size: None,
+                })
+                .collect();
             let _ = self.batched_turn.send_batch(&pkts).await;
         }
 

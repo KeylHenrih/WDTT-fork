@@ -197,22 +197,22 @@ impl AdaptiveKeepalive {
 
     /// Process received Pong response. Returns true if matching probe was confirmed.
     pub fn on_pong(&mut self, probe_id: u16, now: Instant) -> bool {
-        if let Some((pending_id, _sent_at)) = self.pending_probe {
-            if pending_id == probe_id {
-                self.pending_probe = None;
-                self.last_rx = now;
-                // Confirm current interval
-                self.confirmed_interval = self.current_interval;
-                // Grow interval up to maximum ceiling
-                self.current_interval =
-                    (self.current_interval + self.config.step).min(self.config.max_interval);
+        if let Some((pending_id, _sent_at)) = self.pending_probe
+            && pending_id == probe_id
+        {
+            self.pending_probe = None;
+            self.last_rx = now;
+            // Confirm current interval
+            self.confirmed_interval = self.current_interval;
+            // Grow interval up to maximum ceiling
+            self.current_interval =
+                (self.current_interval + self.config.step).min(self.config.max_interval);
 
-                // Persist confirmed interval to network cache if bound
-                if let Some((ref net_id, ref cache)) = self.network_binding {
-                    cache.store(net_id.clone(), self.confirmed_interval);
-                }
-                return true;
+            // Persist confirmed interval to network cache if bound
+            if let Some((ref net_id, ref cache)) = self.network_binding {
+                cache.store(net_id.clone(), self.confirmed_interval);
             }
+            return true;
         }
         false
     }
@@ -260,14 +260,12 @@ mod tests {
 
         // Step up successively: 22 -> 24 -> 25 -> capped at 25s
         let mut cur_t = t2;
-        let mut pid = 102;
-        for expected in [24, 25, 25] {
+        for (pid, expected) in (102u16..).zip([24, 25, 25]) {
             cur_t += ak.current_interval();
             assert!(ak.should_probe(cur_t));
             ak.record_probe_sent(pid, cur_t);
             assert!(ak.on_pong(pid, cur_t + Duration::from_millis(10)));
             assert_eq!(ak.current_interval(), Duration::from_secs(expected));
-            pid += 1;
         }
 
         assert_eq!(ak.confirmed_interval(), Duration::from_secs(25));
@@ -337,7 +335,9 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Keepalive max interval must never exceed 25s for safe margin within UDP NAT")]
+    #[should_panic(
+        expected = "Keepalive max interval must never exceed 25s for safe margin within UDP NAT"
+    )]
     fn test_adaptive_keepalive_rejects_unsafe_ceiling() {
         let cfg = AdaptiveKeepaliveConfig {
             max_interval: Duration::from_secs(28),

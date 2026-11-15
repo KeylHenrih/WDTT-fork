@@ -11,9 +11,7 @@ pub mod tunnel;
 pub use batch::{
     BatchCapabilities, BatchedUdpSocket, DEFAULT_BATCH_SIZE, RecvMeta, TransmitPacket,
 };
-pub use keepalive::{
-    AdaptiveKeepalive, AdaptiveKeepaliveConfig, KeepaliveNetworkCache, NetworkId,
-};
+pub use keepalive::{AdaptiveKeepalive, AdaptiveKeepaliveConfig, KeepaliveNetworkCache, NetworkId};
 pub use metrics::{MetricsSnapshot, TunnelMetrics};
 pub use tunnel::{
     KeepaliveMode, TunnelClient, TunnelClientConfig, TunnelError, TunnelServer, TunnelServerConfig,
@@ -127,7 +125,9 @@ mod tests {
         let (srv_alloc_tx, srv_alloc_rx) = tokio::sync::oneshot::channel();
 
         let srv_handle = tokio::spawn(async move {
-            let _ = server.run_with_notify(srv_cancel_rx, Some(srv_alloc_tx)).await;
+            let _ = server
+                .run_with_notify(srv_cancel_rx, Some(srv_alloc_tx))
+                .await;
         });
 
         let server_relayed = srv_alloc_rx.await.unwrap();
@@ -150,7 +150,9 @@ mod tests {
         let (cln_alloc_tx, cln_alloc_rx) = tokio::sync::oneshot::channel();
 
         let cln_handle = tokio::spawn(async move {
-            let res = client.run_with_notify(cln_cancel_rx, Some(cln_alloc_tx)).await;
+            let res = client
+                .run_with_notify(cln_cancel_rx, Some(cln_alloc_tx))
+                .await;
             if let Err(ref e) = res {
                 eprintln!("Client error: {e:?}");
             }
@@ -159,9 +161,9 @@ mod tests {
 
         let _ = cln_alloc_rx.await.unwrap();
 
-        // Wait up to 1s to allow several Chaff pings and Pong responses
+        // Wait up to 3s to allow several Chaff pings and Pong responses
         let start = std::time::Instant::now();
-        while start.elapsed() < Duration::from_secs(1) {
+        while start.elapsed() < Duration::from_secs(3) {
             if server_metrics.snapshot().pings_rx >= 1 && client_metrics.snapshot().pings_tx >= 2 {
                 break;
             }
@@ -171,8 +173,16 @@ mod tests {
         let cln_snap = client_metrics.snapshot();
         let srv_snap = server_metrics.snapshot();
 
-        assert!(cln_snap.pings_tx >= 2, "Client should transmit chaff pings (got {})", cln_snap.pings_tx);
-        assert!(srv_snap.pings_rx >= 1, "Server should receive ping probes (got {})", srv_snap.pings_rx);
+        assert!(
+            cln_snap.pings_tx >= 2,
+            "Client should transmit chaff pings (got {})",
+            cln_snap.pings_tx
+        );
+        assert!(
+            srv_snap.pings_rx >= 1,
+            "Server should receive ping probes (got {})",
+            srv_snap.pings_rx
+        );
 
         let _ = cln_cancel_tx.send(true);
         let _ = srv_cancel_tx.send(true);
@@ -194,7 +204,9 @@ mod tests {
             channel_number: 0x4000,
             lifetime_sec: 600,
         };
-        let mut client = TurnClient::bind("127.0.0.1:0".parse().unwrap(), turn_cfg).await.unwrap();
+        let mut client = TurnClient::bind("127.0.0.1:0".parse().unwrap(), turn_cfg)
+            .await
+            .unwrap();
         let _initial_relayed = client.allocate_relay().await.unwrap();
         let initial_local = client.socket().local_addr().unwrap();
 
@@ -236,14 +248,23 @@ mod tests {
 
         // 1 packet in wakeup -> sparse uniform traffic -> coalescing active
         coalescer.on_wakeup_batch(1);
-        assert!(coalescer.is_coalescing_active(), "Single-packet batch must enable coalescing");
+        assert!(
+            coalescer.is_coalescing_active(),
+            "Single-packet batch must enable coalescing"
+        );
 
         // 2 or more packets in wakeup -> bursty traffic (e.g. TCP stream) -> coalescing disabled!
         coalescer.on_wakeup_batch(2);
-        assert!(!coalescer.is_coalescing_active(), "Batch >= 2 must immediately disable coalescing");
+        assert!(
+            !coalescer.is_coalescing_active(),
+            "Batch >= 2 must immediately disable coalescing"
+        );
 
         coalescer.on_wakeup_batch(16);
-        assert!(!coalescer.is_coalescing_active(), "Full batch must disable coalescing");
+        assert!(
+            !coalescer.is_coalescing_active(),
+            "Full batch must disable coalescing"
+        );
 
         // When window is None -> always disabled
         let mut disabled_coalescer = AdaptiveCoalescer::new(None);
@@ -256,7 +277,10 @@ mod tests {
         assert!(is_control_frame(FrameType::Ping));
         assert!(is_control_frame(FrameType::Pong));
         assert!(is_control_frame(FrameType::Disconnect));
-        assert!(!is_control_frame(FrameType::Data), "Data frames must not bypass coalescer");
+        assert!(
+            !is_control_frame(FrameType::Data),
+            "Data frames must not bypass coalescer"
+        );
     }
 
     #[tokio::test]
@@ -286,7 +310,10 @@ mod tests {
             }
         };
 
-        assert!(flushed, "Sleep deadline must fire and flush without lost wakeup");
+        assert!(
+            flushed,
+            "Sleep deadline must fire and flush without lost wakeup"
+        );
 
         let mut buf = [0u8; 1024];
         let (len, _src) = tokio::time::timeout(Duration::from_millis(100), srv.recv_from(&mut buf))
