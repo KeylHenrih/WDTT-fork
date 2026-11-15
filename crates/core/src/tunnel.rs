@@ -271,10 +271,6 @@ impl TunnelClient {
         let my_relayed = turn_client.allocate_relay().await?;
         info!("Client allocated relay address: {my_relayed}");
 
-        if let Some(tx) = on_allocated {
-            let _ = tx.send(my_relayed);
-        }
-
         turn_client
             .bind_peer(self.config.server_relayed_addr)
             .await?;
@@ -318,7 +314,11 @@ impl TunnelClient {
             &mut knock_frame,
         );
         turn_client.send_channel_data(&knock_frame).await?;
-        debug!("Pre-Auth knock sent to server");
+        info!("Pre-Auth knock sent to server");
+
+        if let Some(tx) = on_allocated {
+            let _ = tx.send(my_relayed);
+        }
 
         let batched_wg = BatchedUdpSocket::new(wg_socket.clone());
         let batched_turn = BatchedUdpSocket::new(turn_client.socket().clone());
@@ -579,6 +579,7 @@ impl TunnelClient {
                                     coalesce_turn_sleep.as_mut().reset(d);
                                 }
                             } else if !pending_turn_frames.is_empty() {
+                                trace!("TunnelClient sending {} frames to TURN {}", pending_turn_frames.len(), self.config.turn_server_addr);
                                 let pkts: Vec<TransmitPacket> = pending_turn_frames.iter().map(|b| TransmitPacket {
                                     buf: b,
                                     addr: self.config.turn_server_addr,
@@ -602,10 +603,16 @@ impl TunnelClient {
                             for i in 0..count {
                                 let meta = turn_batch_metas[i];
                                 let slice = &turn_batch_bufs[i][..meta.len];
-                                if let Ok(Some(TurnIncoming::ChannelData { payload, .. })) =
-                                    turn_client.parse_incoming(slice, meta.addr)
+                                let incoming = turn_client.parse_incoming(slice, meta.addr);
+                                let payload = match incoming {
+                                    Ok(Some(TurnIncoming::ChannelData { payload, .. })) => Some(payload),
+                                    Ok(Some(TurnIncoming::DataIndication { payload, .. })) => Some(payload),
+                                    _ => None,
+                                };
+                                if let Some(payload) = payload
                                     && let Ok((view, _)) = FrameView::decode(&payload)
                                 {
+                                        trace!("TunnelClient received frame type: {:?}", view.header.frame_type);
                                         match view.header.frame_type {
                                             FrameType::Data => {
                                                 let data_payload = view.payload;
@@ -700,6 +707,7 @@ impl TunnelClient {
                                         coalesce_wg_sleep.as_mut().reset(d);
                                     }
                                 } else if !pending_wg_frames.is_empty() {
+                                    trace!("TunnelClient forwarding {} packets to WG target {}", pending_wg_frames.len(), target);
                                     let pkts: Vec<TransmitPacket> = pending_wg_frames.iter().map(|b| TransmitPacket {
                                         buf: b,
                                         addr: target,
@@ -892,6 +900,7 @@ impl SessionWorker {
                                     addr: self.wg_endpoint_addr,
                                     gso_segment_size: None,
                                 }).collect();
+                                trace!("SessionWorker forwarding {} packets to WG endpoint {}", pkts.len(), self.wg_endpoint_addr);
                                 let _ = batched_wg.send_batch(&pkts).await;
                                 pending_wg_frames.clear();
                                 coalesce_wg_deadline = None;
@@ -912,6 +921,7 @@ impl SessionWorker {
                         Ok(count) => {
                             self.metrics.record_batch_rx(count);
                             adaptive_coalescer.on_wakeup_batch(count);
+                            trace!("SessionWorker received {} packets from WG backend", count);
 
                             for i in 0..count {
                                 let meta = wg_batch_metas[i];
@@ -1213,9 +1223,12 @@ impl TunnelServer {
 
                                     if let Some(peer) = target_peer {
                                         if let Some(tx) = active_sessions.get(&peer) {
+                                            trace!("TunnelServer dispatching {} bytes to worker for {}", payload.len(), peer);
                                             let mut b = BytesMut::new();
                                             b.extend_from_slice(&payload);
-                                            let _ = tx.try_send(b);
+                                            if let Err(e) = tx.try_send(b) {
+                                                warn!("Failed to dispatch to session worker for {peer}: {e}");
+                                            }
                                         } else {
                                             debug!("Unauthenticated data packet for {peer} dropped silently");
                                         }
