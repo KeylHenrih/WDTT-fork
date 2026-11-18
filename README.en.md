@@ -45,7 +45,7 @@ flowchart LR
 
 ## 3. Project Structure and Status
 
-The project is currently under active development (Stage 4). All components are engineered from scratch in Rust (2024 edition) under GPL-3.0:
+The project is currently under active development. All components are engineered from scratch in Rust (2024 edition) under GPL-3.0. See [docs/ROADMAP.md](docs/ROADMAP.md) for the current plan and stage status:
 
 | Component | Location | Description | Implementation Status |
 | :--- | :--- | :--- | :--- |
@@ -56,7 +56,7 @@ The project is currently under active development (Stage 4). All components are 
 | **`wdtt-server`** | [`crates/server`](crates/server) | Standalone server daemon for Linux (x86_64, aarch64 musl static) | **Implemented** (benchmarked at >1.8 Gbps) |
 | **`wdttd`** | [`crates/daemon`](crates/daemon) | Client daemon for Linux, Windows, macOS | **Implemented** (verified with kernel WireGuard) |
 | **`wdtt-ipc`** | [`crates/ipc`](crates/ipc) | IPC protocol between daemon and UI (Zero-Copy Postcard) | **Implemented** (base IPC schemas) |
-| **`wdtt-gui`** | [`crates/gui-desktop`](crates/gui-desktop) | Lightweight native desktop GUI using Slint | **In Development** (scheduled for Stage 4) |
+| **`wdtt-gui`** | [`crates/gui-desktop`](crates/gui-desktop) | Desktop GUI built on `wry`/`tao` (plus a working `captcha_helper`) | **In Development** (scaffold) |
 | **`wdtt-android`** | [`crates/ffi-android`](crates/ffi-android) | Kotlin Jetpack Compose UI + Rust Core (UniFFI / VpnService) | **In Development** (FFI builds in CI, UI in Stage 4) |
 
 ---

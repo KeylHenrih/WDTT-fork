@@ -36,7 +36,7 @@ cargo +nightly fuzz run fuzz_stun -- -max_total_time=60
 ```
 
 ### Fuzzing in CI
-Short smoke fuzz runs (10 seconds per target) execute automatically on every push in `.github/workflows/ci.yml`.
+Short smoke fuzz runs (5 seconds per target) execute automatically on every push in `.github/workflows/ci.yml`.
 
 ---
 

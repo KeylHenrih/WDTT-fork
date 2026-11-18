@@ -48,7 +48,7 @@ pub trait TurnCredentialProvider: Send + Sync {
        FatalError(String),
    }
    ```
-3. Ядро `crates/core` и сетевой транспорт **не зависят от HTTP, браузеров или WebView**. Обработка `NeedsUserInteraction` делегируется клиентскому интерфейсу (Slint GUI или Android Compose).
+3. Ядро `crates/core` и сетевой транспорт **не зависят от HTTP, браузеров или WebView**. Обработка `NeedsUserInteraction` делегируется клиентскому интерфейсу (десктопный GUI или Android Compose).
 
 ## Последствия
 - Высокая устойчивость архитектуры: выход из строя или блокировка VK API не ломает сетевое ядро `wdtt-rs`.

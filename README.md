@@ -45,7 +45,7 @@ flowchart LR
 
 ## 3. Состав проекта и текущий статус
 
-Проект находится в стадии активной разработки (Этап 4). Все компоненты разрабатываются с нуля на языке Rust (Edition 2024) под лицензией GPL-3.0:
+Проект находится в стадии активной разработки. Все компоненты разрабатываются с нуля на языке Rust (Edition 2024) под лицензией GPL-3.0. Актуальный план и статус этапов — в [docs/ROADMAP.md](docs/ROADMAP.md):
 
 | Компонент | Расположение | Описание | Статус реализации |
 | :--- | :--- | :--- | :--- |
@@ -56,7 +56,7 @@ flowchart LR
 | **`wdtt-server`** | [`crates/server`](crates/server) | Серверный демон для Linux (x86_64, aarch64 musl static) | **Реализовано** (протестирован на скоростях >1.8 Гбит/с) |
 | **`wdttd`** | [`crates/daemon`](crates/daemon) | Клиентский демон для Linux, Windows, macOS | **Реализовано** (проверен в связке с ядром WireGuard) |
 | **`wdtt-ipc`** | [`crates/ipc`](crates/ipc) | Межпроцессное взаимодействие UI и демона (Zero-Copy Postcard) | **Реализовано** (базовая схема IPC) |
-| **`wdtt-gui`** | [`crates/gui-desktop`](crates/gui-desktop) | Легковесный графический интерфейс на Slint | **В разработке** (запланирован на Этап 4) |
+| **`wdtt-gui`** | [`crates/gui-desktop`](crates/gui-desktop) | Графический интерфейс на `wry`/`tao` (+ рабочий `captcha_helper`) | **В разработке** (каркас) |
 | **`wdtt-android`** | [`crates/ffi-android`](crates/ffi-android) | Kotlin Jetpack Compose UI + Rust Core (UniFFI / VpnService) | **В разработке** (каркас FFI собран в CI, UI на Этапе 4) |
 
 ---
