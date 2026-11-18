@@ -4,14 +4,12 @@
 //! bare IP packets with no 4-byte packet-information prefix. The descriptor is
 //! registered with the tokio reactor and exposed as an async read/write pair.
 
+use crate::netcfg::{IFNAMSIZ, set_mtu, set_up, zeroed_ifreq};
 use crate::{TunConfig, TunError};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-
-/// Maximum interface name length accepted by the kernel (`IFNAMSIZ - 1`).
-const IFNAMSIZ: usize = 16;
 
 /// `IFF_TUN`: the device carries IP packets.
 const IFF_TUN: libc::c_short = 0x0001;
@@ -207,75 +205,6 @@ fn interface_name(fd: RawFd) -> Result<String, TunError> {
         .take_while(|b| *b != 0)
         .collect();
     Ok(String::from_utf8_lossy(&raw).into_owned())
-}
-
-/// Apply the MTU to an existing interface via `SIOCSIFMTU`.
-fn set_mtu(name: &str, mtu: u16) -> Result<(), TunError> {
-    let sock = control_socket()?;
-    let mut ifr = ifreq_with_name(name)?;
-    ifr.ifr_ifru.ifru_mtu = libc::c_int::from(mtu);
-
-    // SAFETY: `ifr` is a valid `ifreq` with a NUL-terminated name and the
-    // socket is an open AF_INET control socket.
-    let rc = unsafe { libc::ioctl(sock.as_raw_fd(), libc::SIOCSIFMTU, &ifr) };
-    if rc < 0 {
-        return Err(TunError::Io(io::Error::last_os_error()));
-    }
-    Ok(())
-}
-
-/// Bring the interface up via `SIOCGIFFLAGS` + `SIOCSIFFLAGS`.
-fn set_up(name: &str) -> Result<(), TunError> {
-    let sock = control_socket()?;
-    let mut ifr = ifreq_with_name(name)?;
-
-    // SAFETY: `ifr` is a valid `ifreq` with a NUL-terminated name.
-    let rc = unsafe { libc::ioctl(sock.as_raw_fd(), libc::SIOCGIFFLAGS, &mut ifr) };
-    if rc < 0 {
-        return Err(TunError::Io(io::Error::last_os_error()));
-    }
-
-    // SAFETY: `SIOCGIFFLAGS` above initialized `ifru_flags`.
-    unsafe {
-        ifr.ifr_ifru.ifru_flags |= (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short;
-    }
-
-    // SAFETY: `ifr` carries the flags read above plus `IFF_UP`.
-    let rc = unsafe { libc::ioctl(sock.as_raw_fd(), libc::SIOCSIFFLAGS, &ifr) };
-    if rc < 0 {
-        return Err(TunError::Io(io::Error::last_os_error()));
-    }
-    Ok(())
-}
-
-/// Open a throwaway AF_INET datagram socket used for interface ioctls.
-fn control_socket() -> Result<OwnedFd, TunError> {
-    // SAFETY: `socket` is called with valid domain/type/protocol constants.
-    let raw = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
-    if raw < 0 {
-        return Err(TunError::Io(io::Error::last_os_error()));
-    }
-    // SAFETY: `raw` is a freshly created descriptor owned by us.
-    Ok(unsafe { OwnedFd::from_raw_fd(raw) })
-}
-
-/// Build a zeroed `ifreq` with the interface name copied in.
-fn ifreq_with_name(name: &str) -> Result<libc::ifreq, TunError> {
-    if name.len() >= IFNAMSIZ || name.as_bytes().contains(&0) {
-        return Err(TunError::InvalidName(name.to_string()));
-    }
-    let mut ifr: libc::ifreq = zeroed_ifreq();
-    for (dst, src) in ifr.ifr_name.iter_mut().zip(name.as_bytes().iter()) {
-        *dst = *src as libc::c_char;
-    }
-    Ok(ifr)
-}
-
-/// All-zero `ifreq`, the documented starting state for every ioctl above.
-fn zeroed_ifreq() -> libc::ifreq {
-    // SAFETY: `ifreq` is a plain C struct of integers and byte arrays; an
-    // all-zero bit pattern is a valid value for it.
-    unsafe { std::mem::zeroed() }
 }
 
 #[cfg(test)]
