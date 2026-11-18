@@ -24,14 +24,16 @@ use wdtt_proto::{
     inspect_wg_packet,
 };
 use wdtt_turn::{
-    StreamClientConfig, StreamServerConfig, StreamTurnClient, StreamTurnServer, TurnClient,
-    TurnClientConfig, TurnError, TurnIncoming, TurnTransportMode, encode_channel_data,
+    StreamClientConfig, StreamConnectionHandle, StreamPool, StreamServerConfig, StreamTurnServer,
+    TurnClient, TurnClientConfig, TurnError, TurnIncoming, TurnTransportMode, encode_channel_data,
     encode_tcp_channel_data,
 };
 
 const RESEQUENCER_TICK_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_PACKET_LEN: usize = 2048;
 const DEFAULT_SESSION_TTL: Duration = Duration::from_secs(300);
+/// How often the client probes idle pooled streams and prunes dead ones.
+const STREAM_POOL_PRUNE_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Helper to create and bind non-blocking UDP socket with 4 MB send/recv buffers.
 fn tune_socket_buffers(sock: &socket2::Socket) {
@@ -847,20 +849,25 @@ impl TunnelClient {
             tx_queue_capacity: 1024,
         };
 
-        let (mut stream_client, my_relayed) = self.establish_stream(&stream_cfg).await?;
+        let mut pool = self.establish_stream_pool(&stream_cfg).await?;
+        let mut guard = pool.acquire().await?;
+        let my_relayed = guard
+            .relayed_addr()
+            .ok_or_else(|| TunnelError::Timeout("stream has no relayed address".into()))?;
 
         let mut alloc_refresh_timer = tokio::time::interval_at(
-            tokio::time::Instant::now() + stream_client.allocation_refresh_interval(),
-            stream_client.allocation_refresh_interval(),
+            tokio::time::Instant::now() + guard.allocation_refresh_interval(),
+            guard.allocation_refresh_interval(),
         );
         let mut perm_refresh_timer = tokio::time::interval_at(
-            tokio::time::Instant::now() + stream_client.permission_refresh_interval(),
-            stream_client.permission_refresh_interval(),
+            tokio::time::Instant::now() + guard.permission_refresh_interval(),
+            guard.permission_refresh_interval(),
         );
         let mut chan_bind_refresh_timer = tokio::time::interval_at(
-            tokio::time::Instant::now() + stream_client.channel_bind_refresh_interval(),
-            stream_client.channel_bind_refresh_interval(),
+            tokio::time::Instant::now() + guard.channel_bind_refresh_interval(),
+            guard.channel_bind_refresh_interval(),
         );
+        let mut prune_timer = interval(STREAM_POOL_PRUNE_INTERVAL);
 
         if let Some(tx) = on_allocated {
             let _ = tx.send(my_relayed);
@@ -901,25 +908,31 @@ impl TunnelClient {
                     }
 
                     _ = alloc_refresh_timer.tick() => {
-                        let requested_sec = stream_client.negotiated_lifetime();
+                        let requested_sec = guard.negotiated_lifetime();
                         trace!("Stream TURN allocation refreshing ({requested_sec}s)");
-                        if let Err(e) = stream_client.refresh_allocation(requested_sec).await {
+                        if let Err(e) = guard.refresh_allocation(requested_sec).await {
                             warn!("Failed to refresh stream TURN allocation: {e}");
                         }
                     }
 
                     _ = perm_refresh_timer.tick() => {
                         trace!("Stream TURN permission refreshing");
-                        if let Err(e) = stream_client.refresh_permission().await {
+                        if let Err(e) = guard.refresh_permission().await {
                             warn!("Failed to refresh stream TURN permission: {e}");
                         }
                     }
 
                     _ = chan_bind_refresh_timer.tick() => {
                         trace!("Stream TURN channel bind refreshing");
-                        if let Err(e) = stream_client.refresh_channel_bind().await {
+                        if let Err(e) = guard.refresh_channel_bind().await {
                             warn!("Failed to refresh stream TURN channel bind: {e}");
                         }
+                    }
+
+                    _ = prune_timer.tick() => {
+                        // The checked-out stream is skipped by the probe, so
+                        // this only retires idle streams that stopped answering.
+                        pool.probe_and_prune().await;
                     }
 
                     _ = tick_timer.tick(), if !resequencer.is_empty() => {
@@ -960,7 +973,7 @@ impl TunnelClient {
                                 &mut ping_frame,
                             );
                             seq_tx = seq_tx.wrapping_add(1);
-                            if let Err(e) = stream_client.send_channel_data(&ping_frame).await {
+                            if let Err(e) = guard.send_channel_data(&ping_frame).await {
                                 warn!("Failed to send Keepalive Ping over stream: {e}");
                                 adaptive_keepalive.on_loss(now);
                             } else {
@@ -986,7 +999,7 @@ impl TunnelClient {
                                     encode_frame(FrameType::Data, 0, 0, seq_tx, payload, &mut frame);
                                     seq_tx = seq_tx.wrapping_add(1);
 
-                                    if let Err(e) = stream_client.send_channel_data(&frame).await {
+                                    if let Err(e) = guard.send_channel_data(&frame).await {
                                         warn!("Failed to send ChannelData over stream: {e}");
                                     } else {
                                         self.metrics.record_tx(meta.len);
@@ -1000,7 +1013,7 @@ impl TunnelClient {
                     }
 
                     // Incoming frames from stream -> forward to WireGuard
-                    stream_msg_res = stream_client.recv_frame() => {
+                    stream_msg_res = guard.recv_frame() => {
                         match stream_msg_res {
                             Ok(turn_incoming) => {
                                 let payload = match turn_incoming {
@@ -1117,27 +1130,41 @@ impl TunnelClient {
                         }
                     }
 
-                    match self.establish_stream(&stream_cfg).await {
-                        Ok((client, relayed)) => {
-                            stream_client = client;
-                            info!("Reconnected to TURN relay at {relayed}");
-                            alloc_refresh_timer = tokio::time::interval_at(
-                                tokio::time::Instant::now()
-                                    + stream_client.allocation_refresh_interval(),
-                                stream_client.allocation_refresh_interval(),
-                            );
-                            perm_refresh_timer = tokio::time::interval_at(
-                                tokio::time::Instant::now()
-                                    + stream_client.permission_refresh_interval(),
-                                stream_client.permission_refresh_interval(),
-                            );
-                            chan_bind_refresh_timer = tokio::time::interval_at(
-                                tokio::time::Instant::now()
-                                    + stream_client.channel_bind_refresh_interval(),
-                                stream_client.channel_bind_refresh_interval(),
-                            );
-                            backoff.reset();
-                            continue 'reconnect;
+                    // The checked-out stream failed; retire it and let the pool
+                    // refill before we try to reconnect.
+                    guard.release(&mut pool, false).await;
+
+                    match self.establish_stream_pool(&stream_cfg).await {
+                        Ok(new_pool) => {
+                            pool = new_pool;
+                            match pool.acquire().await {
+                                Ok(new_guard) => {
+                                    guard = new_guard;
+                                    let relayed = guard.relayed_addr();
+                                    info!("Reconnected to TURN relay at {relayed:?}");
+                                    alloc_refresh_timer = tokio::time::interval_at(
+                                        tokio::time::Instant::now()
+                                            + guard.allocation_refresh_interval(),
+                                        guard.allocation_refresh_interval(),
+                                    );
+                                    perm_refresh_timer = tokio::time::interval_at(
+                                        tokio::time::Instant::now()
+                                            + guard.permission_refresh_interval(),
+                                        guard.permission_refresh_interval(),
+                                    );
+                                    chan_bind_refresh_timer = tokio::time::interval_at(
+                                        tokio::time::Instant::now()
+                                            + guard.channel_bind_refresh_interval(),
+                                        guard.channel_bind_refresh_interval(),
+                                    );
+                                    backoff.reset();
+                                    continue 'reconnect;
+                                }
+                                Err(e) => {
+                                    warn!("Reconnection attempt failed: {e}");
+                                    continue 'reconnect;
+                                }
+                            }
                         }
                         Err(e) => {
                             warn!("Reconnection attempt failed: {e}");
@@ -1203,24 +1230,29 @@ impl TunnelClient {
             tx_queue_capacity: 1024,
         };
 
-        let (mut stream_client, my_relayed) = self.establish_stream(&stream_cfg).await?;
+        let mut pool = self.establish_stream_pool(&stream_cfg).await?;
+        let mut guard = pool.acquire().await?;
+        let my_relayed = guard
+            .relayed_addr()
+            .ok_or_else(|| TunnelError::Timeout("stream has no relayed address".into()))?;
 
         if let Some(tx) = on_allocated {
             let _ = tx.send(my_relayed);
         }
 
         let mut alloc_refresh_timer = tokio::time::interval_at(
-            tokio::time::Instant::now() + stream_client.allocation_refresh_interval(),
-            stream_client.allocation_refresh_interval(),
+            tokio::time::Instant::now() + guard.allocation_refresh_interval(),
+            guard.allocation_refresh_interval(),
         );
         let mut perm_refresh_timer = tokio::time::interval_at(
-            tokio::time::Instant::now() + stream_client.permission_refresh_interval(),
-            stream_client.permission_refresh_interval(),
+            tokio::time::Instant::now() + guard.permission_refresh_interval(),
+            guard.permission_refresh_interval(),
         );
         let mut chan_bind_refresh_timer = tokio::time::interval_at(
-            tokio::time::Instant::now() + stream_client.channel_bind_refresh_interval(),
-            stream_client.channel_bind_refresh_interval(),
+            tokio::time::Instant::now() + guard.channel_bind_refresh_interval(),
+            guard.channel_bind_refresh_interval(),
         );
+        let mut prune_timer = interval(STREAM_POOL_PRUNE_INTERVAL);
 
         let (wg_tx, mut wg_rx) = mpsc::channel::<Vec<u8>>(1024);
         let (in_tx, in_rx) = mpsc::channel::<Vec<u8>>(1024);
@@ -1289,36 +1321,40 @@ impl TunnelClient {
                     }
 
                     _ = alloc_refresh_timer.tick() => {
-                        let requested_sec = stream_client.negotiated_lifetime();
-                        if let Err(e) = stream_client.refresh_allocation(requested_sec).await {
+                        let requested_sec = guard.negotiated_lifetime();
+                        if let Err(e) = guard.refresh_allocation(requested_sec).await {
                             warn!("Failed to refresh stream TURN allocation: {e}");
                         }
                     }
 
                     _ = perm_refresh_timer.tick() => {
-                        if let Err(e) = stream_client.refresh_permission().await {
+                        if let Err(e) = guard.refresh_permission().await {
                             warn!("Failed to refresh stream TURN permission: {e}");
                         }
                     }
 
                     _ = chan_bind_refresh_timer.tick() => {
-                        if let Err(e) = stream_client.refresh_channel_bind().await {
+                        if let Err(e) = guard.refresh_channel_bind().await {
                             warn!("Failed to refresh stream TURN channel bind: {e}");
                         }
+                    }
+
+                    _ = prune_timer.tick() => {
+                        pool.probe_and_prune().await;
                     }
 
                     Some(datagram) = wg_rx.recv() => {
                         let mut frame = BytesMut::new();
                         encode_frame(FrameType::Data, 0, 0, seq_tx, &datagram, &mut frame);
                         seq_tx = seq_tx.wrapping_add(1);
-                        if let Err(e) = stream_client.send_channel_data(&frame).await {
+                        if let Err(e) = guard.send_channel_data(&frame).await {
                             warn!("Failed to send ChannelData over stream: {e}");
                         } else {
                             self.metrics.record_tx(datagram.len());
                         }
                     }
 
-                    stream_msg_res = stream_client.recv_frame() => {
+                    stream_msg_res = guard.recv_frame() => {
                         match stream_msg_res {
                             Ok(turn_incoming) => {
                                 let payload = match turn_incoming {
@@ -1394,30 +1430,43 @@ impl TunnelClient {
                         }
                     }
 
-                    match self.establish_stream(&stream_cfg).await {
-                        Ok((client, relayed)) => {
-                            stream_client = client;
-                            info!("Reconnected to TURN relay at {relayed}");
+                    // The checked-out stream failed; retire it and let the pool
+                    // refill before we try to reconnect.
+                    guard.release(&mut pool, false).await;
 
-                            // The refresh timers were scheduled against the old
-                            // allocation; restart them so they do not fire
-                            // immediately against the new one.
-                            alloc_refresh_timer = tokio::time::interval_at(
-                                tokio::time::Instant::now()
-                                    + stream_client.allocation_refresh_interval(),
-                                stream_client.allocation_refresh_interval(),
-                            );
-                            perm_refresh_timer = tokio::time::interval_at(
-                                tokio::time::Instant::now()
-                                    + stream_client.permission_refresh_interval(),
-                                stream_client.permission_refresh_interval(),
-                            );
-                            chan_bind_refresh_timer = tokio::time::interval_at(
-                                tokio::time::Instant::now()
-                                    + stream_client.channel_bind_refresh_interval(),
-                                stream_client.channel_bind_refresh_interval(),
-                            );
-                            backoff.reset();
+                    match self.establish_stream_pool(&stream_cfg).await {
+                        Ok(new_pool) => {
+                            pool = new_pool;
+                            match pool.acquire().await {
+                                Ok(new_guard) => {
+                                    guard = new_guard;
+                                    let relayed = guard.relayed_addr();
+                                    info!("Reconnected to TURN relay at {relayed:?}");
+
+                                    // The refresh timers were scheduled against the old
+                                    // allocation; restart them so they do not fire
+                                    // immediately against the new one.
+                                    alloc_refresh_timer = tokio::time::interval_at(
+                                        tokio::time::Instant::now()
+                                            + guard.allocation_refresh_interval(),
+                                        guard.allocation_refresh_interval(),
+                                    );
+                                    perm_refresh_timer = tokio::time::interval_at(
+                                        tokio::time::Instant::now()
+                                            + guard.permission_refresh_interval(),
+                                        guard.permission_refresh_interval(),
+                                    );
+                                    chan_bind_refresh_timer = tokio::time::interval_at(
+                                        tokio::time::Instant::now()
+                                            + guard.channel_bind_refresh_interval(),
+                                        guard.channel_bind_refresh_interval(),
+                                    );
+                                    backoff.reset();
+                                }
+                                Err(e) => {
+                                    warn!("Reconnection attempt failed: {e}");
+                                }
+                            }
                         }
                         Err(e) => {
                             warn!("Reconnection attempt failed: {e}");
@@ -1432,23 +1481,34 @@ impl TunnelClient {
         result
     }
 
-    /// Establishes a stream TURN allocation and sends the pre-auth knock.
+    /// Establishes a pool of stream TURN allocations and sends the pre-auth knock.
     ///
     /// Split out of [`Self::run_tun_with_notify`] so the datapath can call it
-    /// again after a transport failure without duplicating the handshake.
-    async fn establish_stream(
+    /// again after a transport failure without duplicating the handshake. The
+    /// pool keeps several allocations alive so a single dead stream does not
+    /// take the tunnel down with it.
+    async fn establish_stream_pool(
         &self,
         stream_cfg: &StreamClientConfig,
-    ) -> Result<(StreamTurnClient, SocketAddr), TunnelError> {
-        let mut stream_client = StreamTurnClient::connect(stream_cfg.clone()).await?;
-        let my_relayed = stream_client.allocate_relay().await?;
-        info!("Client allocated relay address over stream: {my_relayed}");
+    ) -> Result<StreamPool, TunnelError> {
+        let mut pool = StreamPool::new(
+            stream_cfg.clone(),
+            crate::MIN_STREAMS,
+            crate::MAX_STREAMS_PER_HASH,
+        );
+        if pool.fill().await == 0 {
+            return Err(TunnelError::Turn(wdtt_turn::TurnError::Transport(
+                "stream pool could not establish any stream".into(),
+            )));
+        }
+        info!(
+            "Client established {} of {} stream allocations",
+            pool.len(),
+            pool.target_size()
+        );
 
-        stream_client
-            .bind_peer(self.config.server_relayed_addr)
-            .await?;
-        info!("Client bound peer {}", self.config.server_relayed_addr);
-
+        // Send the pre-auth knock on every stream so any of them can carry the
+        // session once it is checked out.
         let knock_key = derive_pre_auth_knock_key(&Psk::from_bytes(self.config.psk));
         let auth = KnockAuthenticator::new(knock_key, DEFAULT_MAX_CLOCK_SKEW_SEC);
         let now_sec = SystemTime::now()
@@ -1471,10 +1531,15 @@ impl TunnelClient {
             &knock_wire,
             &mut knock_frame,
         );
-        stream_client.send_channel_data(&knock_frame).await?;
-        info!("Pre-Auth knock sent to server over stream");
 
-        Ok((stream_client, my_relayed))
+        for _ in 0..pool.len() {
+            let mut guard = pool.acquire().await?;
+            guard.send_channel_data(&knock_frame).await?;
+            guard.release(&mut pool, true).await;
+        }
+        info!("Pre-Auth knock sent to server over {} streams", pool.len());
+
+        Ok(pool)
     }
 
     /// Run the client datapath until cancellation signal is received.
@@ -2165,6 +2230,200 @@ impl StreamSessionWorker {
     }
 }
 
+/// One live tunnel session as seen by the stream connection tasks.
+///
+/// The `sender` feeds the session's worker with inbound frames; `tx` is the
+/// outbound queue of the connection that most recently carried a knock for this
+/// session, so replies follow the client to whichever pooled stream it is
+/// currently reading from.
+struct StreamSessionEntry {
+    sender: mpsc::Sender<BytesMut>,
+    tx: mpsc::Sender<Bytes>,
+}
+
+/// Serve one accepted TURN stream connection for its whole lifetime.
+///
+/// The connection first has to prove itself with a pre-auth knock; after that
+/// every `Data` frame it carries is dispatched to the session worker of the
+/// session id the knock announced. Because a client pool opens several streams
+/// that share one session id, the worker is keyed by session id in a map shared
+/// with every other connection task, and each new knock re-points that
+/// session's outbound channel at the connection that sent it. That way the
+/// client can read the session's replies from whichever pooled stream it
+/// currently has checked out.
+///
+/// `sessions` maps session id -> session entry and is shared across all
+/// connection tasks.
+#[allow(clippy::too_many_arguments)]
+async fn serve_stream_connection(
+    handle: StreamConnectionHandle,
+    peer: SocketAddr,
+    auth: Arc<std::sync::Mutex<KnockAuthenticator>>,
+    sessions: Arc<std::sync::Mutex<HashMap<[u8; 16], StreamSessionEntry>>>,
+    wg_endpoint_addr: SocketAddr,
+    metrics: Arc<TunnelMetrics>,
+    coalesce_window: Option<Duration>,
+    cancel_rx: &mut watch::Receiver<bool>,
+) {
+    let mut handle = handle;
+    let mut session_id: Option<[u8; 16]> = None;
+
+    loop {
+        tokio::select! {
+            biased;
+
+            _ = cancel_rx.changed() => {
+                if *cancel_rx.borrow() {
+                    break;
+                }
+            }
+
+            ctl = handle.control_rx.recv() => {
+                match ctl {
+                    Some(resp) => {
+                        if handle.tx.send(resp).await.is_err() {
+                            break;
+                        }
+                    }
+                    None => break,
+                }
+            }
+
+            inbound = handle.rx.recv() => {
+                let payload = match inbound {
+                    Some(p) => p,
+                    None => break,
+                };
+
+                if let Ok((view, _)) = FrameView::decode(&payload)
+                    && view.header.frame_type == FrameType::HandshakeInit
+                {
+                    let now_sec = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    let verified = {
+                        // The replay cache inside the authenticator is shared
+                        // across every connection, so a knock cannot be
+                        // replayed on a second stream.
+                        let mut auth = auth.lock().expect("knock authenticator poisoned");
+                        auth.verify_knock_packet(now_sec, view.payload)
+                    };
+                    match verified {
+                        Ok(knock_payload) => {
+                            let sid = knock_payload.session_id;
+                            info!(
+                                "Pre-Auth Knock verified over stream for peer {peer} (session {:02X?})",
+                                &sid[..4]
+                            );
+
+                            // Create the session (and its worker) only on the
+                            // first knock for this id. A later knock on another
+                            // pooled stream only re-points the outbound channel.
+                            let mut spawn_worker = false;
+                            let mut worker_rx = None;
+                            {
+                                let mut map = sessions.lock().expect("session map poisoned");
+                                match map.get_mut(&sid) {
+                                    Some(entry) if !entry.sender.is_closed() => {
+                                        // Re-point the session at this
+                                        // connection: the client may have moved
+                                        // to a different pooled stream.
+                                        entry.tx = handle.tx.clone();
+                                    }
+                                    _ => {
+                                        let (session_tx, session_rx) = mpsc::channel(2048);
+                                        map.insert(
+                                            sid,
+                                            StreamSessionEntry {
+                                                sender: session_tx,
+                                                tx: handle.tx.clone(),
+                                            },
+                                        );
+                                        worker_rx = Some(session_rx);
+                                        spawn_worker = true;
+                                    }
+                                }
+                            }
+
+                            if spawn_worker {
+                                let worker = StreamSessionWorker {
+                                    session_id: sid,
+                                    wg_endpoint_addr,
+                                    tx: handle.tx.clone(),
+                                    metrics: metrics.clone(),
+                                    coalesce_window,
+                                    inbound_rx: worker_rx.expect("receiver created with the session"),
+                                };
+                                let worker_cancel = cancel_rx.clone();
+                                tokio::spawn(async move {
+                                    if let Err(e) = worker.run(worker_cancel).await {
+                                        warn!("StreamSessionWorker terminated: {e}");
+                                    }
+                                });
+                            }
+
+                            session_id = Some(sid);
+
+                            let mut resp_frame = BytesMut::new();
+                            encode_frame(
+                                FrameType::HandshakeResp,
+                                0,
+                                0,
+                                0,
+                                b"WDTT2-OK",
+                                &mut resp_frame,
+                            );
+                            let mut framed = BytesMut::new();
+                            encode_tcp_channel_data(0x4000, &resp_frame, &mut framed);
+                            if handle.tx.send(framed.freeze()).await.is_err() {
+                                break;
+                            }
+                            continue;
+                        }
+                        Err(e) => {
+                            debug!("Invalid knock over stream from {peer}: {e}");
+                            continue;
+                        }
+                    }
+                }
+
+                let sid = match session_id {
+                    Some(s) => s,
+                    None => {
+                        trace!("Unauthenticated stream payload from {peer} dropped");
+                        continue;
+                    }
+                };
+                let sender = {
+                    let map = sessions.lock().expect("session map poisoned");
+                    map.get(&sid).map(|e| e.sender.clone())
+                };
+                if let Some(sender) = sender {
+                    let mut b = BytesMut::new();
+                    b.extend_from_slice(&payload);
+                    if let Err(e) = sender.try_send(b) {
+                        warn!("Dispatch to stream session queue full: {e}");
+                    }
+                }
+            }
+        }
+    }
+
+    // The connection may be the session's current outbound path. If so, drop
+    // the session so a fresh knock on another stream can rebuild it rather than
+    // leaving the worker writing into a closed channel.
+    if let Some(sid) = session_id {
+        let mut map = sessions.lock().expect("session map poisoned");
+        if let Some(entry) = map.get(&sid)
+            && entry.tx.same_channel(&handle.tx)
+        {
+            map.remove(&sid);
+        }
+    }
+    debug!("Stream TURN connection from {peer} closed");
+}
+
 /// Server tunnel session terminating TURN relay and forwarding to WireGuard endpoint.
 pub struct TunnelServer {
     config: TunnelServerConfig,
@@ -2473,15 +2732,17 @@ impl TunnelServer {
         }
 
         let knock_key = derive_pre_auth_knock_key(&Psk::from_bytes(self.config.psk));
-        let mut auth = KnockAuthenticator::new(knock_key, DEFAULT_MAX_CLOCK_SKEW_SEC);
+        let auth: Arc<std::sync::Mutex<KnockAuthenticator>> = Arc::new(std::sync::Mutex::new(
+            KnockAuthenticator::new(knock_key, DEFAULT_MAX_CLOCK_SKEW_SEC),
+        ));
 
-        struct StreamSessionEntry {
-            sender: mpsc::Sender<BytesMut>,
-            tx: mpsc::Sender<Bytes>,
-        }
-
-        let mut sessions_by_id: HashMap<[u8; 16], StreamSessionEntry> = HashMap::new();
-        let mut conn_to_session: HashMap<SocketAddr, [u8; 16]> = HashMap::new();
+        // Sessions are shared across connection tasks: one client may open
+        // several streams (a pool) that all carry the same session id, and the
+        // stream that first delivered the knock is not necessarily the one that
+        // will carry the WireGuard datagrams. The map is only ever touched
+        // without holding it across an await, so a std mutex is enough.
+        type SessionMap = Arc<std::sync::Mutex<HashMap<[u8; 16], StreamSessionEntry>>>;
+        let sessions_by_id: SessionMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
 
         loop {
             tokio::select! {
@@ -2495,7 +2756,7 @@ impl TunnelServer {
                 }
 
                 accepted = server.accept() => {
-                    let mut handle = match accepted {
+                    let handle = match accepted {
                         Ok(h) => h,
                         Err(e) => {
                             warn!("Stream accept failed: {e}");
@@ -2505,135 +2766,30 @@ impl TunnelServer {
                     let peer = handle.peer_addr;
                     debug!("Accepted stream TURN connection from {peer}");
 
-                    let mut session_id: Option<[u8; 16]> = None;
-
-                    loop {
-                        tokio::select! {
-                            biased;
-
-                            _ = cancel_rx.changed() => {
-                                if *cancel_rx.borrow() {
-                                    return Ok(());
-                                }
-                            }
-
-                            ctl = handle.control_rx.recv() => {
-                                match ctl {
-                                    Some(resp) => {
-                                        if handle.tx.send(resp).await.is_err() {
-                                            break;
-                                        }
-                                    }
-                                    None => break,
-                                }
-                            }
-
-                            inbound = handle.rx.recv() => {
-                                let payload = match inbound {
-                                    Some(p) => p,
-                                    None => break,
-                                };
-
-                                if let Ok((view, _)) = FrameView::decode(&payload)
-                                    && view.header.frame_type == FrameType::HandshakeInit
-                                {
-                                    let now_sec = SystemTime::now()
-                                        .duration_since(UNIX_EPOCH)
-                                        .unwrap_or_default()
-                                        .as_secs();
-                                    match auth.verify_knock_packet(now_sec, view.payload) {
-                                        Ok(knock_payload) => {
-                                            let sid = knock_payload.session_id;
-                                            info!(
-                                                "Pre-Auth Knock verified over stream for peer {peer} (session {:02X?})",
-                                                &sid[..4]
-                                            );
-
-                                            let is_new = !sessions_by_id.contains_key(&sid)
-                                                || sessions_by_id.get(&sid).unwrap().sender.is_closed();
-
-                                            if is_new {
-                                                let (session_tx, session_rx) = mpsc::channel(2048);
-                                                let worker = StreamSessionWorker {
-                                                    session_id: sid,
-                                                    wg_endpoint_addr: self.config.wg_endpoint_addr,
-                                                    tx: handle.tx.clone(),
-                                                    metrics: self.metrics.clone(),
-                                                    coalesce_window: self.config.coalesce_window,
-                                                    inbound_rx: session_rx,
-                                                };
-                                                let worker_cancel = cancel_rx.clone();
-                                                tokio::spawn(async move {
-                                                    if let Err(e) = worker.run(worker_cancel).await {
-                                                        warn!("StreamSessionWorker terminated: {e}");
-                                                    }
-                                                });
-                                                sessions_by_id.insert(
-                                                    sid,
-                                                    StreamSessionEntry {
-                                                        sender: session_tx,
-                                                        tx: handle.tx.clone(),
-                                                    },
-                                                );
-                                            }
-
-                                            conn_to_session.insert(peer, sid);
-                                            session_id = Some(sid);
-
-                                            let mut resp_frame = BytesMut::new();
-                                            encode_frame(
-                                                FrameType::HandshakeResp,
-                                                0,
-                                                0,
-                                                0,
-                                                b"WDTT2-OK",
-                                                &mut resp_frame,
-                                            );
-                                            let mut framed = BytesMut::new();
-                                            encode_tcp_channel_data(0x4000, &resp_frame, &mut framed);
-                                            if handle.tx.send(framed.freeze()).await.is_err() {
-                                                break;
-                                            }
-                                            continue;
-                                        }
-                                        Err(e) => {
-                                            debug!("Invalid knock over stream from {peer}: {e}");
-                                            continue;
-                                        }
-                                    }
-                                }
-
-                                let sid = match session_id {
-                                    Some(s) => s,
-                                    None => {
-                                        trace!("Unauthenticated stream payload from {peer} dropped");
-                                        continue;
-                                    }
-                                };
-                                if let Some(entry) = sessions_by_id.get(&sid)
-                                    && !entry.sender.is_closed()
-                                {
-                                    let mut b = BytesMut::new();
-                                    b.extend_from_slice(&payload);
-                                    if let Err(e) = entry.sender.try_send(b) {
-                                        warn!("Dispatch to stream session queue full: {e}");
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    if let Some(sid) = session_id {
-                        conn_to_session.remove(&peer);
-                        if let Some(entry) = sessions_by_id.get(&sid)
-                            && entry.tx.same_channel(&handle.tx)
-                        {
-                            sessions_by_id.remove(&sid);
-                        }
-                    }
-                    debug!("Stream TURN connection from {peer} closed");
-                    sessions_by_id.retain(|_, entry| !entry.sender.is_closed());
-                    conn_to_session.retain(|_, id| sessions_by_id.contains_key(id));
+                    // Each connection is served by its own task. The accept loop
+                    // must stay responsive: the client keeps a pool of parallel
+                    // streams, and serving them inline would leave every stream
+                    // but the first unread (its socket buffer fills up while
+                    // nothing drains it).
+                    let sessions = sessions_by_id.clone();
+                    let auth = auth.clone();
+                    let mut conn_cancel = cancel_rx.clone();
+                    let wg_endpoint_addr = self.config.wg_endpoint_addr;
+                    let metrics = self.metrics.clone();
+                    let coalesce_window = self.config.coalesce_window;
+                    tokio::spawn(async move {
+                        serve_stream_connection(
+                            handle,
+                            peer,
+                            auth,
+                            sessions,
+                            wg_endpoint_addr,
+                            metrics,
+                            coalesce_window,
+                            &mut conn_cancel,
+                        )
+                        .await;
+                    });
                 }
             }
         }

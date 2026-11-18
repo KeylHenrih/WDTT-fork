@@ -5,6 +5,7 @@ pub mod channel;
 pub mod client;
 pub mod error;
 pub mod mock_server;
+pub mod pool;
 pub mod stream_client;
 pub mod stream_server;
 pub mod stun;
@@ -17,6 +18,10 @@ pub use channel::{
 pub use client::{TurnClient, TurnClientConfig, TurnIncoming};
 pub use error::TurnError;
 pub use mock_server::MockTurnServer;
+pub use pool::{
+    DEFAULT_MAX_STREAMS, DEFAULT_POOL_SIZE, DEFAULT_PROBE_TIMEOUT, StreamGuard, StreamPool,
+    establish_pool,
+};
 pub use stream_client::{StreamClientConfig, StreamTurnClient};
 pub use stream_server::{StreamConnectionHandle, StreamServerConfig, StreamTurnServer};
 pub use stun::{
