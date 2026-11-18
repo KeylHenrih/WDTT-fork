@@ -8,6 +8,8 @@
 pub mod dns;
 pub mod geo;
 #[cfg(target_os = "linux")]
+pub mod killswitch;
+#[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
 pub mod netcfg;
@@ -20,6 +22,8 @@ pub mod routing;
 pub mod wg;
 
 pub use dns::{DnsServer, DnsServerConfig, ResolverBackend, ResolverError, SystemResolver};
+#[cfg(target_os = "linux")]
+pub use killswitch::{KillSwitchConfig, KillSwitchError};
 #[cfg(target_os = "linux")]
 pub use linux::TunDevice;
 #[cfg(target_os = "linux")]
