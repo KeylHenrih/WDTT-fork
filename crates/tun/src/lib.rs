@@ -14,6 +14,7 @@ pub mod netcfg;
 pub mod netlink;
 #[cfg(target_os = "linux")]
 pub mod nft;
+pub mod resolver;
 pub mod routing;
 pub mod wg;
 
