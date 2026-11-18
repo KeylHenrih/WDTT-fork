@@ -5,6 +5,7 @@
 
 #![deny(missing_docs)]
 
+pub mod dns;
 pub mod geo;
 #[cfg(target_os = "linux")]
 mod linux;
@@ -18,6 +19,7 @@ pub mod resolver;
 pub mod routing;
 pub mod wg;
 
+pub use dns::{DnsServer, DnsServerConfig, ResolverBackend, ResolverError, SystemResolver};
 #[cfg(target_os = "linux")]
 pub use linux::TunDevice;
 #[cfg(target_os = "linux")]
