@@ -8,7 +8,7 @@ use std::time::Duration;
 use tokio::sync::watch;
 use tracing::{error, info, warn};
 use wdtt_core::{KeepaliveMode, TunnelClient, TunnelClientConfig, TurnTransportMode};
-use wdtt_provider::{CaptchaMode, TurnProvider, VkTurnProvider};
+use wdtt_provider::{CaptchaMode, ProviderConfig, ProviderKind, TurnCredentials, build_provider};
 #[cfg(target_os = "linux")]
 use wdtt_tun::geo::download::{GeoDownloader, GeoFiles};
 #[cfg(target_os = "linux")]
@@ -33,6 +33,7 @@ struct ClientArgs {
     workers: usize,
     turn_transport: TurnTransportMode,
     turn_sni: Option<String>,
+    provider: Option<ProviderKind>,
     vk_hash: Option<String>,
     vk_cache_path: PathBuf,
     earliest_time_secs: u64,
@@ -79,6 +80,7 @@ impl ClientArgs {
             .unwrap_or(2);
         let mut turn_transport = TurnTransportMode::Udp;
         let mut turn_sni = None;
+        let mut provider = None;
         let mut vk_hash = None;
         let default_cache = dirs_home().join(".config/wdtt-dev/vk_creds.json");
         let mut vk_cache_path = default_cache;
@@ -218,6 +220,16 @@ impl ClientArgs {
                             ));
                         }
                     };
+                }
+                "--provider" => {
+                    i += 1;
+                    let val = args.get(i).ok_or("Missing value for --provider")?;
+                    provider = Some(ProviderKind::from_name(val).ok_or_else(|| {
+                        format!(
+                            "Unknown provider '{val}', expected: {}",
+                            ProviderKind::all_names().join(", ")
+                        )
+                    })?);
                 }
                 "--profile" => {
                     i += 1;
@@ -421,7 +433,8 @@ impl ClientArgs {
                            --psk <HEX>                     Pre-shared key: 64 hex chars (or raw 32-byte string)\n  \
                            --keepalive <MODE>              Keepalive mode: powersave (default), chaff, disabled\n  \
                            --coalesce-ms <MS>              Coalesce window for outbound datagrams (0 = off)\n  \
-                           --profile <NAME>                Provider profile (default: vk)\n  \
+                           --profile <NAME>                Keepalive profile: powersave (default), performance, chaff\n  \
+                           --provider <NAME>               Credential provider: vk, static (inferred if omitted)\n  \
                            --vk-hash <HASH>                VK call hash (alternative to --vk-link)\n  \
                            --vk-link <URL>                 VK call join link\n  \
                            --vk-cache <PATH>               Path to the VK credential cache file\n  \
@@ -457,6 +470,7 @@ impl ClientArgs {
             workers,
             turn_transport,
             turn_sni,
+            provider,
             vk_hash,
             vk_cache_path,
             earliest_time_secs,
@@ -533,19 +547,62 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn async_main(mut args: ClientArgs) -> Result<(), Box<dyn std::error::Error>> {
     info!("=== WDTT v2 Client Daemon (Stage 5 VK/TURN M2) ===");
 
-    // If VK Hash or Link is configured, acquire TURN credentials via VkTurnProvider
-    if let Some(ref hash) = args.vk_hash {
-        info!("Initializing VK Calls TURN credential provider (hash: {hash})...");
-        let provider =
-            VkTurnProvider::new(hash, args.vk_cache_path.clone(), args.earliest_time_secs)
-                .with_bind_interface(args.bind_iface.clone())
-                .with_captcha_mode(args.captcha_mode);
+    // Resolve which provider to use. An explicit `--provider` wins; otherwise
+    // a VK call link implies the VK provider, and a plain relay address
+    // implies static credentials.
+    let kind = match args.provider {
+        Some(kind) => Some(kind),
+        None if args.vk_hash.is_some() => Some(ProviderKind::Vk),
+        None if args.turn_server.is_some() || args.turn_domain.is_some() => {
+            Some(ProviderKind::Static)
+        }
+        None => None,
+    };
+
+    if let Some(kind) = kind {
+        let config = ProviderConfig {
+            kind: Some(kind),
+            vk_hash: args.vk_hash.clone(),
+            vk_cache_path: Some(args.vk_cache_path.clone()),
+            earliest_time_secs: Some(args.earliest_time_secs),
+            captcha_mode: Some(args.captcha_mode),
+            bind_interface: args.bind_iface.clone(),
+            static_credentials: Some(TurnCredentials {
+                username: args.turn_username.clone(),
+                password: args.turn_password.clone(),
+                host: args
+                    .turn_server
+                    .map(|a| a.ip().to_string())
+                    .or_else(|| args.turn_domain.as_ref().map(|(h, _)| h.clone()))
+                    .unwrap_or_default(),
+                port: args
+                    .turn_server
+                    .map(|a| a.port())
+                    .or_else(|| args.turn_domain.as_ref().map(|(_, p)| *p))
+                    .unwrap_or(3478),
+                realm: args.turn_realm.clone(),
+                use_udp: args.turn_transport == TurnTransportMode::Udp,
+                expires_at: 0,
+            }),
+        };
+
+        let provider = build_provider(&config)?;
+        info!(
+            "Acquiring TURN credentials via the {} provider...",
+            kind.name()
+        );
         let creds = provider.acquire_credentials().await?;
 
         args.turn_username = creds.username;
         args.turn_password = creds.password;
         args.turn_realm = creds.realm;
-        args.turn_sni = Some(creds.host.clone());
+        // Only a provider that hands back a hostname may set the SNI. The
+        // static provider echoes whatever relay address the user passed, which
+        // is usually an IP literal; overwriting an explicit `--sni` with it
+        // breaks the TLS handshake against a listener that needs a real name.
+        if kind == ProviderKind::Vk || creds.host.parse::<std::net::IpAddr>().is_err() {
+            args.turn_sni = Some(creds.host.clone());
+        }
         if args.turn_transport == TurnTransportMode::Udp && !creds.use_udp {
             args.turn_transport = TurnTransportMode::Tls;
         }
@@ -566,10 +623,12 @@ async fn async_main(mut args: ClientArgs) -> Result<(), Box<dyn std::error::Erro
             .ok_or_else(|| format!("No IP addresses found for TURN host {}", creds.host))?;
 
         args.turn_server = Some(resolved);
-        info!("Resolved VK TURN server {} -> {resolved}", creds.host);
+        info!("Resolved TURN server {} -> {resolved}", creds.host);
 
-        // Check UDP reachability to VK TURN (port 3478)
-        check_vk_turn_udp(&creds.host, args.bind_iface.as_deref()).await;
+        if kind == ProviderKind::Vk {
+            // Check UDP reachability to VK TURN (port 3478)
+            check_vk_turn_udp(&creds.host, args.bind_iface.as_deref()).await;
+        }
     } else if let Some((ref domain, port)) = args.turn_domain
         && args.turn_server.is_none()
     {

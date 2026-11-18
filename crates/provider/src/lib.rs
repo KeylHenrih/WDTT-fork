@@ -7,12 +7,14 @@
 #![deny(missing_docs)]
 
 pub mod cache;
+pub mod factory;
 pub mod vk;
 
 pub use cache::{
     CachedTurnEndpoint, CachedVkCredentials, VkRequestCounter, load_cached_credentials,
     load_raw_cached_credentials, save_cached_credentials,
 };
+pub use factory::{ProviderConfig, ProviderKind, build_provider};
 pub use vk::{CaptchaMode, VkTurnProvider};
 
 use async_trait::async_trait;
