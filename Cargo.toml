@@ -49,7 +49,7 @@ md-5 = "0.10"
 hmac = "0.12"
 zeroize = { version = "1.8", features = ["derive"] }
 subtle = "2.6"
-rand = "0.9"
+rand = "0.10"
 
 # WireGuard
 boringtun = "0.7.1"
