@@ -27,7 +27,7 @@
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::process::Stdio;
 
 use tokio::io::AsyncWriteExt as _;
@@ -52,6 +52,12 @@ pub const SET_TUNNEL_PORTS: &str = "tunnel_ports";
 
 /// Name of the chain that marks packets for the policy route.
 pub const CHAIN_MARK: &str = "mark_out";
+
+/// Name of the address set holding destinations that are never tunnelled.
+///
+/// Only emitted in inverted mode, where it is consulted with `!=` to select
+/// everything outside the white list.
+pub const SET_DIRECT_V4: &str = "direct_v4";
 
 /// Name of the nftables table holding blocked destinations.
 ///
@@ -140,6 +146,12 @@ pub struct CompiledRuleset {
     /// terminal `drop` instead of a mark, and are rendered into their own table
     /// so a block rule can never be confused with a routing decision.
     pub block_rules: Vec<MarkRule>,
+    /// Rules whose destinations must never be tunnelled.
+    ///
+    /// Their addresses form an *exclusion* set. When at least one such rule
+    /// exists the mark chain inverts: instead of marking the addresses that
+    /// must be tunnelled, it marks everything that is **not** in this set.
+    pub direct_rules: Vec<MarkRule>,
     /// Rules whose projection is not exact.
     pub approximations: Vec<Approximation>,
 }
@@ -147,8 +159,8 @@ pub struct CompiledRuleset {
 impl CompiledRuleset {
     /// Returns true when no rule would mark any packet.
     ///
-    /// This deliberately ignores [`Self::block_rules`]: callers use it to
-    /// decide whether the mark table has anything to install.
+    /// This deliberately ignores [`Self::block_rules`] and [`Self::direct_rules`]:
+    /// callers use it to decide whether the mark table has anything to install.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.rules.is_empty()
@@ -159,6 +171,133 @@ impl CompiledRuleset {
     pub fn has_block_rules(&self) -> bool {
         !self.block_rules.is_empty()
     }
+
+    /// Returns true when the ruleset asks for the marking to be inverted.
+    ///
+    /// An inverted ruleset tunnels everything that is not explicitly excluded,
+    /// which is how "VPN by default with a white list" is expressed.
+    #[must_use]
+    pub fn is_inverted(&self) -> bool {
+        !self.direct_rules.is_empty()
+    }
+
+    /// Returns the addresses that must never be tunnelled.
+    ///
+    /// These come from `direct` rules and, in inverted mode, from the local
+    /// and infrastructure ranges the caller seeds in. The result is coalesced
+    /// into a minimal set of non-overlapping, exactly-covering CIDR blocks:
+    /// nftables rejects an interval set whose elements overlap, and the
+    /// sources routinely do (a white-list category carries addresses inside
+    /// the local ranges, and the relay often sits inside a white-listed
+    /// range). A merged interval that is not an aligned power-of-two block is
+    /// emitted as several CIDRs, since no single one denotes it.
+    #[must_use]
+    pub fn direct_exclusions(&self) -> Vec<Cidr> {
+        let items: Vec<Cidr> = self
+            .direct_rules
+            .iter()
+            .flat_map(|rule| rule.dest_v4.iter().cloned())
+            .collect();
+        coalesce_v4(&items)
+    }
+}
+
+/// Merges IPv4 CIDRs into a minimal set of non-overlapping ranges.
+///
+/// nftables rejects an interval set whose elements overlap ("conflicting
+/// intervals specified"), and the exclusion set is assembled from several
+/// sources: white-list categories, the local infrastructure ranges and the
+/// relay address. Those routinely overlap — `geoip:ru` carries addresses
+/// inside `10.0.0.0/8`, and the relay often sits inside a white-listed range —
+/// so the raw concatenation is not installable. Coalescing overlapping and
+/// adjacent ranges produces the minimal equivalent set, which nft accepts and
+/// which the kernel walks faster.
+///
+/// IPv6 entries are dropped: the rendered set is `type ipv4_addr`.
+fn coalesce_v4(items: &[Cidr]) -> Vec<Cidr> {
+    let mut ranges: Vec<(u32, u32)> = items
+        .iter()
+        .filter_map(|cidr| match cidr.addr {
+            IpAddr::V4(addr) => {
+                let prefix = cidr.prefix.min(32);
+                let start = u32::from(addr);
+                if prefix == 0 {
+                    return Some((0, u32::MAX));
+                }
+                let mask = u32::MAX << (32 - prefix);
+                let host = if prefix == 0 { u32::MAX } else { !mask };
+                Some((start & mask, start | host))
+            }
+            IpAddr::V6(_) => None,
+        })
+        .collect();
+
+    if ranges.is_empty() {
+        return Vec::new();
+    }
+
+    ranges.sort_unstable();
+
+    let mut merged: Vec<(u32, u32)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        match merged.last_mut() {
+            // `end + 1` would overflow when a range reaches the top of the
+            // address space, so the adjacency test guards it explicitly.
+            Some(last) if start <= last.1 || last.1 != u32::MAX && start == last.1 + 1 => {
+                if end > last.1 {
+                    last.1 = end;
+                }
+            }
+            _ => merged.push((start, end)),
+        }
+    }
+
+    merged
+        .into_iter()
+        .flat_map(|(start, end)| decompose_range(start, end))
+        .collect()
+}
+
+/// Splits the inclusive address range `start..=end` into CIDR blocks.
+///
+/// A merged interval is not necessarily an aligned power-of-two block: two
+/// adjacent CIDRs whose union has a non-power-of-two span, such as
+/// `5.8.0.0/18` followed by `5.8.64.0/19`, merge into the 24576-address range
+/// `5.8.0.0..=5.8.95.255`. No single CIDR denotes that range — the shortest
+/// one covering it is `5.8.0.0/17`, which also spans the following addresses.
+/// Emitting that wider CIDR would overlap the next element and nft would
+/// reject the whole set with "conflicting intervals specified".
+///
+/// The range is therefore decomposed greedily: at every step take the largest
+/// aligned block that starts at the current address and fits within what is
+/// left, then advance past it. The blocks are exact — together they cover the
+/// range with no gap and no excess.
+fn decompose_range(start: u32, end: u32) -> Vec<Cidr> {
+    let mut out = Vec::new();
+    let mut cursor = u64::from(start);
+    let last = u64::from(end);
+    // The cursor is compared against the range end before any arithmetic, so a
+    // block that runs past `end` still terminates the loop.
+    while cursor <= last {
+        // Largest power-of-two block that is aligned at `cursor`.
+        let alignment = if cursor == 0 {
+            1u64 << 32
+        } else {
+            1u64 << (cursor.trailing_zeros().min(32))
+        };
+        let remaining = last - cursor + 1;
+        let mut size = 1u64;
+        while size * 2 <= remaining && size * 2 <= alignment {
+            size *= 2;
+        }
+        let prefix = 32 - (size.trailing_zeros() as u8);
+        out.push(Cidr {
+            addr: IpAddr::V4(Ipv4Addr::from(cursor as u32)),
+            prefix,
+        });
+        cursor += size;
+    }
+    out
 }
 
 /// Projects a routing table onto nftables mark and drop rules.
@@ -166,8 +305,11 @@ impl CompiledRuleset {
 /// [`Outbound::Proxy`] rules are projected as mark rules: the ruleset's job is
 /// to mark packets that must take the policy route. [`Outbound::Block`] rules
 /// are projected as drop rules in a separate table, so they terminate the
-/// packet locally instead of routing it. Rules selecting `direct` or a named
-/// tag are left to the routing engine and produce no packet-layer statement.
+/// packet locally instead of routing it. [`Outbound::Direct`] rules contribute
+/// their addresses to an exclusion set; as soon as at least one of them exists
+/// the mark chain flips to "mark everything that is not excluded", so these
+/// rules stop being inert. A named tag is left to the routing engine and
+/// produces no packet-layer statement.
 ///
 /// `resolved` supplies addresses obtained by resolving the domains referenced
 /// by a rule. A rule with domain criteria and no entry in `resolved` is
@@ -182,7 +324,7 @@ pub fn compile_ruleset(
     for rule in table.rules() {
         let matcher = &rule.matcher;
         let outbound = rule.outbound.clone();
-        if matches!(outbound, Outbound::Direct | Outbound::Tagged(_)) {
+        if matches!(outbound, Outbound::Tagged(_)) {
             continue;
         }
 
@@ -270,6 +412,9 @@ pub fn compile_ruleset(
         if mark_rule.is_catch_all() {
             let detail = match outbound {
                 Outbound::Block => "rule matches every packet; it would block all traffic",
+                Outbound::Direct => {
+                    "rule matches every packet; it would exclude all traffic from the tunnel"
+                }
                 _ => "rule matches every packet; it would route all traffic through the tunnel",
             };
             out.approximations.push(Approximation {
@@ -280,6 +425,7 @@ pub fn compile_ruleset(
 
         match outbound {
             Outbound::Block => out.block_rules.push(mark_rule),
+            Outbound::Direct => out.direct_rules.push(mark_rule),
             _ => out.rules.push(mark_rule),
         }
     }
@@ -321,6 +467,7 @@ pub fn render_ruleset(ruleset: &CompiledRuleset) -> String {
 
     let any_address_set = ruleset.rules.iter().any(uses_address_set);
     let any_port_set = ruleset.rules.iter().any(uses_port_set);
+    let inverted = ruleset.is_inverted();
 
     if any_address_set {
         let addresses: BTreeSet<String> = ruleset
@@ -333,6 +480,19 @@ pub fn render_ruleset(ruleset: &CompiledRuleset) -> String {
         let _ = writeln!(out, "\t\ttype ipv4_addr");
         let _ = writeln!(out, "\t\tflags interval");
         let _ = writeln!(out, "\t\telements = {{ {} }}", join(&addresses));
+        let _ = writeln!(out, "\t}}");
+    }
+
+    if inverted {
+        let exclusions: BTreeSet<String> = ruleset
+            .direct_exclusions()
+            .iter()
+            .map(render_cidr)
+            .collect();
+        let _ = writeln!(out, "\tset {SET_DIRECT_V4} {{");
+        let _ = writeln!(out, "\t\ttype ipv4_addr");
+        let _ = writeln!(out, "\t\tflags interval");
+        let _ = writeln!(out, "\t\telements = {{ {} }}", join(&exclusions));
         let _ = writeln!(out, "\t}}");
     }
 
@@ -356,15 +516,42 @@ pub fn render_ruleset(ruleset: &CompiledRuleset) -> String {
         "\t\ttype route hook output priority mangle; policy accept;"
     );
 
-    for rule in &ruleset.rules {
-        for line in render_mark_rule(rule) {
-            let _ = writeln!(out, "\t\t{line}");
+    // DNS must resolve through the host's own resolver even in inverted mode:
+    // routing lookups through the tunnel would return foreign addresses and
+    // break the very white list the exclusion set encodes.
+    for line in render_dns_bypass() {
+        let _ = writeln!(out, "\t\t{line}");
+    }
+
+    if inverted {
+        let _ = writeln!(
+            out,
+            "\t\tip daddr != @{SET_DIRECT_V4} meta mark set {WDTT_FWMARK:#x}"
+        );
+    } else {
+        for rule in &ruleset.rules {
+            for line in render_mark_rule(rule) {
+                let _ = writeln!(out, "\t\t{line}");
+            }
         }
     }
 
     let _ = writeln!(out, "\t}}");
     let _ = writeln!(out, "}}");
     out
+}
+
+/// Renders the DNS bypass statements used in inverted mode.
+///
+/// The resolver ports are exempted from marking so a lookup leaves directly,
+/// even though every other destination would be tunnelled.
+fn render_dns_bypass() -> Vec<String> {
+    vec![
+        "meta l4proto udp th dport 53 return".to_owned(),
+        "meta l4proto tcp th dport 53 return".to_owned(),
+        "meta l4proto tcp th dport 853 return".to_owned(),
+        "meta l4proto udp th dport 853 return".to_owned(),
+    ]
 }
 
 /// Renders the block rules into their own table.
@@ -769,6 +956,191 @@ mod tests {
         let mark = render_ruleset(&ruleset);
         assert!(!mark.contains("wdtt_block"));
         assert!(!mark.contains("counter drop"));
+    }
+
+    #[test]
+    fn direct_rules_build_exclusion_set() {
+        let table = table_from_json(
+            r#"{"rules":[
+                {"ip":["1.1.1.1"],"outboundTag":"direct"},
+                {"ip":["2.2.2.2"],"outboundTag":"proxy"}
+            ]}"#,
+        );
+        let ruleset = compile_ruleset(&table, &std::collections::HashMap::new());
+        assert!(ruleset.is_inverted());
+        assert_eq!(ruleset.direct_rules.len(), 1);
+        let exclusions: Vec<String> = ruleset
+            .direct_exclusions()
+            .iter()
+            .map(render_cidr)
+            .collect();
+        assert_eq!(exclusions, vec!["1.1.1.1"]);
+    }
+
+    #[test]
+    fn inversion_marks_everything_else() {
+        let table = table_from_json(r#"{"rules":[{"ip":["1.1.1.1"],"outboundTag":"direct"}]}"#);
+        let ruleset = compile_ruleset(&table, &std::collections::HashMap::new());
+        let script = render_ruleset(&ruleset);
+        // The exclusion set is emitted and referenced with a negation.
+        assert!(script.contains("set direct_v4 {"));
+        assert!(script.contains("ip daddr != @direct_v4 meta mark set 0x77647400"));
+        // In inverted mode the positive address set is not referenced by a rule.
+        assert!(!script.contains("ip daddr @tunnel_v4 meta mark"));
+    }
+
+    #[test]
+    fn non_inverted_ruleset_still_marks_the_positive_set() {
+        let table = table_from_json(r#"{"rules":[{"ip":["1.1.1.1"],"outboundTag":"proxy"}]}"#);
+        let ruleset = compile_ruleset(&table, &std::collections::HashMap::new());
+        assert!(!ruleset.is_inverted());
+        let script = render_ruleset(&ruleset);
+        assert!(script.contains("ip daddr @tunnel_v4 meta mark set 0x77647400"));
+        assert!(!script.contains("direct_v4"));
+    }
+
+    #[test]
+    fn dns_is_never_marked_in_inverted_mode() {
+        let table = table_from_json(r#"{"rules":[{"ip":["1.1.1.1"],"outboundTag":"direct"}]}"#);
+        let ruleset = compile_ruleset(&table, &std::collections::HashMap::new());
+        let script = render_ruleset(&ruleset);
+        // Lookups must egress directly, or resolving a white-listed domain
+        // through the tunnel would return foreign addresses.
+        assert!(script.contains("meta l4proto udp th dport 53 return"));
+        assert!(script.contains("meta l4proto tcp th dport 53 return"));
+    }
+
+    #[test]
+    fn overlapping_exclusions_are_coalesced() {
+        // `geoip:ru`-style ranges overlap the infrastructure ranges and the
+        // relay: `10.99.99.0/24` sits inside `10.0.0.0/8`, and both were seeded
+        // alongside the white list. nft rejects such a set with "conflicting
+        // intervals specified", so the merge has to remove the overlap.
+        let table = table_from_json(
+            r#"{"rules":[
+                {"ip":["10.99.99.0/24","10.0.0.0/8","8.8.8.8"],"outboundTag":"direct"}
+            ]}"#,
+        );
+        let ruleset = compile_ruleset(&table, &std::collections::HashMap::new());
+        let exclusions = ruleset.direct_exclusions();
+        let rendered: Vec<String> = exclusions.iter().map(render_cidr).collect();
+        // The subnet collapses into the enclosing /8; only the /8 and the
+        // unrelated host remain.
+        assert_eq!(rendered, vec!["8.8.8.8", "10.0.0.0/8"]);
+
+        // And the rendered set is non-overlapping, which is what nft requires.
+        let mut prev_end: Option<u32> = None;
+        for cidr in &exclusions {
+            let IpAddr::V4(addr) = cidr.addr else {
+                continue;
+            };
+            let start = u32::from(addr);
+            let end = if cidr.prefix == 0 {
+                u32::MAX
+            } else {
+                start
+                    | (if cidr.prefix == 0 {
+                        u32::MAX
+                    } else {
+                        !(u32::MAX << (32 - cidr.prefix))
+                    })
+            };
+            if let Some(prev) = prev_end {
+                assert!(start > prev, "ranges overlap: {rendered:?}");
+            }
+            prev_end = Some(end);
+        }
+    }
+
+    #[test]
+    fn adjacent_exclusions_are_merged() {
+        // Two halves of a /24 must become the /24, not two /25 elements.
+        let table = table_from_json(
+            r#"{"rules":[
+                {"ip":["192.168.1.0/25","192.168.1.128/25"],"outboundTag":"direct"}
+            ]}"#,
+        );
+        let ruleset = compile_ruleset(&table, &std::collections::HashMap::new());
+        let rendered: Vec<String> = ruleset
+            .direct_exclusions()
+            .iter()
+            .map(render_cidr)
+            .collect();
+        assert_eq!(rendered, vec!["192.168.1.0/24"]);
+    }
+
+    #[test]
+    fn non_power_of_two_exclusions_are_decomposed() {
+        // Two adjacent CIDRs whose union spans 24576 addresses form a range
+        // that no single CIDR denotes. Emitting the shortest covering CIDR
+        // (5.8.0.0/17) would overlap the next element, and nft rejects an
+        // interval set with "conflicting intervals specified". The range must
+        // instead be split into exact blocks.
+        let table = table_from_json(
+            r#"{"rules":[
+                {"ip":["5.8.0.0/18","5.8.64.0/19"],"outboundTag":"direct"}
+            ]}"#,
+        );
+        let ruleset = compile_ruleset(&table, &std::collections::HashMap::new());
+        let rendered: Vec<String> = ruleset
+            .direct_exclusions()
+            .iter()
+            .map(render_cidr)
+            .collect();
+        assert_eq!(rendered, vec!["5.8.0.0/18", "5.8.64.0/19"]);
+    }
+
+    #[test]
+    fn exclusions_never_overlap() {
+        // The property nft enforces: in an interval set every element must
+        // start strictly after the previous one's last address. The exclusion
+        // set mixes a white-list category with infrastructure ranges, so
+        // overlaps are the norm before coalescing.
+        let table = table_from_json(
+            r#"{"rules":[
+                {"ip":["10.99.99.0/24","10.0.0.0/8","5.8.0.0/18","5.8.64.0/19","8.8.8.8"],
+                 "outboundTag":"direct"}
+            ]}"#,
+        );
+        let ruleset = compile_ruleset(&table, &std::collections::HashMap::new());
+        let exclusions = ruleset.direct_exclusions();
+        for pair in exclusions.windows(2) {
+            let (left, right) = (&pair[0], &pair[1]);
+            let IpAddr::V4(left_addr) = left.addr else {
+                panic!("IPv6 element survived coalescing");
+            };
+            let IpAddr::V4(right_addr) = right.addr else {
+                panic!("IPv6 element survived coalescing");
+            };
+            let left_end = u32::from(left_addr)
+                | if left.prefix == 0 {
+                    u32::MAX
+                } else {
+                    !(u32::MAX << (32 - left.prefix))
+                };
+            assert!(
+                u32::from(right_addr) > left_end,
+                "{right:?} overlaps {left:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ipv6_exclusions_are_dropped() {
+        // The rendered set is `type ipv4_addr`; an IPv6 element would make nft
+        // reject the whole table.
+        let table = table_from_json(
+            r#"{"rules":[
+                {"ip":["2001:db8::/32","8.8.8.8"],"outboundTag":"direct"}
+            ]}"#,
+        );
+        let ruleset = compile_ruleset(&table, &std::collections::HashMap::new());
+        let rendered: Vec<String> = ruleset
+            .direct_exclusions()
+            .iter()
+            .map(render_cidr)
+            .collect();
+        assert_eq!(rendered, vec!["8.8.8.8"]);
     }
 
     #[test]

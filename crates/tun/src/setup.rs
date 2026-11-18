@@ -44,6 +44,7 @@ use crate::netlink::{self, NlRouteSpec, RuleSpec};
 use crate::nft::{self, CompiledRuleset};
 use crate::resolver::{DomainResolver, ResolverConfig};
 use crate::routing::RoutingTable;
+use crate::routing::matcher::Cidr;
 
 /// Errors raised while configuring or restoring the host.
 #[derive(Debug, thiserror::Error)]
@@ -210,9 +211,28 @@ impl HostSetup {
         }
 
         // 5. Mark rules. Installed after the rule so a marked packet always has
-        //    a table to be routed into.
-        if !self.config.ruleset.is_empty() {
-            nft::apply_ruleset(&self.config.ruleset).await?;
+        //    a table to be routed into. In inverted mode the infrastructure
+        //    ranges are seeded first so the exclusion set can never tunnel the
+        //    relay that carries it.
+        let mut ruleset = self.config.ruleset.clone();
+        if ruleset.is_inverted() {
+            ruleset
+                .direct_rules
+                .extend(
+                    infrastructure_exclusions(&self.config)
+                        .into_iter()
+                        .map(|cidr| nft::MarkRule {
+                            dest_v4: vec![cidr],
+                            dest_ports: Vec::new(),
+                            tcp: true,
+                            udp: true,
+                            uids: Vec::new(),
+                            source_index: usize::MAX,
+                        }),
+                );
+        }
+        if !ruleset.rules.is_empty() || ruleset.is_inverted() {
+            nft::apply_ruleset(&ruleset).await?;
             self.applied.mark_table = true;
         }
 
@@ -362,6 +382,53 @@ pub async fn prepare_ruleset(
     (ruleset, addresses)
 }
 
+/// Addresses that must never enter the tunnel, whatever the rules say.
+///
+/// In inverted mode the exclusion set decides what stays outside, so it has to
+/// carry the local, link-local, multicast and infrastructure ranges as well as
+/// the white list. Without them the tunnel would swallow the relay traffic that
+/// carries it, or loop the tunnel's own subnet back into itself.
+fn infrastructure_exclusions(config: &HostSetupConfig) -> Vec<Cidr> {
+    let mut items: Vec<Cidr> = [
+        ("0.0.0.0", 8),
+        ("10.0.0.0", 8),
+        ("127.0.0.0", 8),
+        ("169.254.0.0", 16),
+        ("172.16.0.0", 12),
+        ("192.168.0.0", 16),
+        ("224.0.0.0", 4),
+        ("255.255.255.255", 32),
+    ]
+    .iter()
+    .map(|(addr, prefix)| Cidr {
+        addr: IpAddr::V4(addr.parse().expect("valid literal")),
+        prefix: *prefix,
+    })
+    .collect();
+
+    items.push(cidr_from_host(config.relay_address));
+
+    let tunnel_prefix = config.tunnel_prefix.min(32);
+    let tunnel_network =
+        Ipv4Addr::from(u32::from(config.tunnel_address) & u32::from(prefix_to_mask(tunnel_prefix)));
+    items.push(Cidr {
+        addr: IpAddr::V4(tunnel_network),
+        prefix: tunnel_prefix,
+    });
+
+    items.sort_by_key(|c| (c.addr, c.prefix));
+    items.dedup();
+    items
+}
+
+/// Builds a host-route CIDR from a single address.
+fn cidr_from_host(addr: Ipv4Addr) -> Cidr {
+    Cidr {
+        addr: IpAddr::V4(addr),
+        prefix: 32,
+    }
+}
+
 /// The default location for the domain-resolution cache.
 pub fn default_cache_dir() -> PathBuf {
     std::env::var_os("XDG_CACHE_HOME")
@@ -437,6 +504,34 @@ mod tests {
         let mut setup = HostSetup::new(cfg);
         setup.teardown().await;
         assert!(!setup.is_applied());
+    }
+
+    #[test]
+    fn infrastructure_exclusions_cover_local_ranges_and_relay() {
+        // A public relay address, deliberately outside the local ranges.
+        let cfg = HostSetupConfig::new(
+            "wdtt0",
+            "10.99.99.2".parse().unwrap(),
+            "192.0.2.10".parse().unwrap(),
+            "wlan0",
+        );
+        let exclusions = infrastructure_exclusions(&cfg);
+        let rendered: Vec<String> = exclusions
+            .iter()
+            .map(|c| format!("{}/{}", c.addr, c.prefix))
+            .collect();
+
+        // The relay must never be tunnelled, or the tunnel carries itself.
+        assert!(rendered.iter().any(|c| c == "192.0.2.10/32"));
+        // The tunnel subnet must not be routed back into the tunnel.
+        assert!(rendered.iter().any(|c| c == "10.99.99.0/24"));
+        // Private and link-local ranges stay outside.
+        assert!(rendered.iter().any(|c| c == "192.168.0.0/16"));
+        assert!(rendered.iter().any(|c| c == "10.0.0.0/8"));
+        assert!(rendered.iter().any(|c| c == "127.0.0.0/8"));
+        assert!(rendered.iter().any(|c| c == "169.254.0.0/16"));
+        // Multicast and broadcast.
+        assert!(rendered.iter().any(|c| c == "224.0.0.0/4"));
     }
 
     #[test]
