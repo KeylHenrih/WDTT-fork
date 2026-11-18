@@ -5,6 +5,14 @@
 
 #![deny(missing_docs)]
 
+#[cfg(target_os = "linux")]
+mod linux;
+pub mod wg;
+
+#[cfg(target_os = "linux")]
+pub use linux::TunDevice;
+pub use wg::{DATA_OVERHEAD_SZ, HANDSHAKE_INIT_SZ, HANDSHAKE_RESP_SZ, WgEngine, WgError, WgOutput};
+
 /// Virtual packet buffer type for TUN payload exchange.
 pub type TunPacket = bytes::Bytes;
 
@@ -14,6 +22,12 @@ pub enum TunError {
     /// Device I/O failure.
     #[error("TUN device I/O error: {0}")]
     Io(#[from] std::io::Error),
+    /// The requested platform is not supported by this build.
+    #[error("TUN devices are not supported on this platform")]
+    Unsupported,
+    /// Interface name is invalid (too long or contains a NUL byte).
+    #[error("invalid interface name {0:?}")]
+    InvalidName(String),
 }
 
 /// Common configuration parameters for creating a virtual TUN interface.

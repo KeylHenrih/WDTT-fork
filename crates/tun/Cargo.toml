@@ -9,3 +9,8 @@ repository.workspace = true
 [dependencies]
 thiserror = { workspace = true }
 bytes = { workspace = true }
+tokio = { workspace = true }
+boringtun = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true }

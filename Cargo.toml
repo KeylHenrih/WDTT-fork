@@ -50,6 +50,9 @@ zeroize = { version = "1.8", features = ["derive"] }
 subtle = "2.6"
 rand = "0.9"
 
+# WireGuard
+boringtun = "0.7.1"
+
 # Testing
 proptest = "1.6"
 
