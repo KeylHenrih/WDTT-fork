@@ -158,6 +158,12 @@ mod tests {
             turn_sni: None,
             custom_ca_der: None,
             bind_interface: None,
+            tun_name: None,
+            tun_mtu: 1360,
+            wg_private_key: None,
+            wg_peer_public_key: None,
+            wg_preshared_key: None,
+            wg_keepalive: None,
         };
         let mut client = TunnelClient::new(client_cfg);
         let client_metrics = client.metrics();

@@ -147,6 +147,19 @@ pub struct TunnelClientConfig {
     pub custom_ca_der: Option<Vec<u8>>,
     /// Optional network interface name for SO_BINDTODEVICE.
     pub bind_interface: Option<String>,
+    /// Optional TUN interface name. When set, the client owns a real TUN
+    /// device and runs WireGuard in-process instead of bridging a UDP socket.
+    pub tun_name: Option<String>,
+    /// TUN interface MTU (default 1360).
+    pub tun_mtu: u16,
+    /// Local WireGuard private key (base64, as produced by `wg genkey`).
+    pub wg_private_key: Option<String>,
+    /// Peer WireGuard public key (base64).
+    pub wg_peer_public_key: Option<String>,
+    /// Optional WireGuard preshared key (base64).
+    pub wg_preshared_key: Option<String>,
+    /// WireGuard persistent keepalive in seconds.
+    pub wg_keepalive: Option<u16>,
 }
 
 /// Configuration parameters for establishing a server tunnel session.
@@ -278,6 +291,9 @@ impl TunnelClient {
         cancel_rx: watch::Receiver<bool>,
         on_allocated: Option<tokio::sync::oneshot::Sender<SocketAddr>>,
     ) -> Result<(), TunnelError> {
+        if self.config.tun_name.is_some() {
+            return self.run_tun_with_notify(cancel_rx, on_allocated).await;
+        }
         match self.config.turn_transport {
             TurnTransportMode::Udp => self.run_udp_with_notify(cancel_rx, on_allocated).await,
             TurnTransportMode::Tcp | TurnTransportMode::Tls => {
@@ -1088,6 +1104,222 @@ impl TunnelClient {
         }
 
         Ok(())
+    }
+
+    /// Run the client datapath with a real TUN device and in-process WireGuard.
+    ///
+    /// The TUN interface carries plain IP packets; [`WgEngine`] encrypts them
+    /// and the resulting datagrams ride the same TURN transport as the UDP
+    /// bridge mode. Requires `tun_name`, `wg_private_key` and
+    /// `wg_peer_public_key` in the config.
+    async fn run_tun_with_notify(
+        &mut self,
+        cancel_rx: watch::Receiver<bool>,
+        on_allocated: Option<tokio::sync::oneshot::Sender<SocketAddr>>,
+    ) -> Result<(), TunnelError> {
+        let tun_name = self
+            .config
+            .tun_name
+            .clone()
+            .ok_or_else(|| TunnelError::Timeout("tun_name missing".into()))?;
+        let private = self
+            .config
+            .wg_private_key
+            .clone()
+            .ok_or_else(|| TunnelError::Timeout("wg_private_key missing".into()))?;
+        let peer = self
+            .config
+            .wg_peer_public_key
+            .clone()
+            .ok_or_else(|| TunnelError::Timeout("wg_peer_public_key missing".into()))?;
+
+        let engine = wdtt_tun::WgEngine::from_base64(
+            &private,
+            &peer,
+            self.config.wg_preshared_key.as_deref(),
+            self.config.wg_keepalive,
+            1,
+        )?;
+
+        info!(
+            "Starting TunnelClient (TUN mode): {} <-> WG <-> TURN {}",
+            tun_name, self.config.turn_server_addr
+        );
+
+        let stream_cfg = StreamClientConfig {
+            server_addr: self.config.turn_server_addr,
+            peer_addr: self.config.server_relayed_addr,
+            username: self.config.turn_username.clone(),
+            password: self.config.turn_password.clone(),
+            channel_number: 0x4000,
+            lifetime_sec: 600,
+            transport: self.config.turn_transport,
+            sni: self.config.turn_sni.clone(),
+            custom_ca_der: self.config.custom_ca_der.clone(),
+            bind_interface: self.config.bind_interface.clone(),
+            tx_queue_capacity: 1024,
+        };
+
+        let mut stream_client = StreamTurnClient::connect(stream_cfg).await?;
+        let my_relayed = stream_client.allocate_relay().await?;
+        info!("Client allocated relay address over stream: {my_relayed}");
+
+        stream_client
+            .bind_peer(self.config.server_relayed_addr)
+            .await?;
+        info!("Client bound peer {}", self.config.server_relayed_addr);
+
+        let knock_key = derive_pre_auth_knock_key(&Psk::from_bytes(self.config.psk));
+        let auth = KnockAuthenticator::new(knock_key, DEFAULT_MAX_CLOCK_SKEW_SEC);
+        let now_sec = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let mut client_nonce = [0u8; 16];
+        let mut session_id = [0u8; 16];
+        rand::rng().fill_bytes(&mut client_nonce);
+        rand::rng().fill_bytes(&mut session_id);
+
+        let knock_wire = auth.generate_knock_packet(now_sec, &client_nonce, &session_id, 32);
+        let mut knock_frame = BytesMut::new();
+        encode_frame(
+            FrameType::HandshakeInit,
+            0,
+            0,
+            0,
+            &knock_wire,
+            &mut knock_frame,
+        );
+        stream_client.send_channel_data(&knock_frame).await?;
+        info!("Pre-Auth knock sent to server over stream");
+
+        if let Some(tx) = on_allocated {
+            let _ = tx.send(my_relayed);
+        }
+
+        let mut alloc_refresh_timer = tokio::time::interval_at(
+            tokio::time::Instant::now() + stream_client.allocation_refresh_interval(),
+            stream_client.allocation_refresh_interval(),
+        );
+        let mut perm_refresh_timer = tokio::time::interval_at(
+            tokio::time::Instant::now() + stream_client.permission_refresh_interval(),
+            stream_client.permission_refresh_interval(),
+        );
+        let mut chan_bind_refresh_timer = tokio::time::interval_at(
+            tokio::time::Instant::now() + stream_client.channel_bind_refresh_interval(),
+            stream_client.channel_bind_refresh_interval(),
+        );
+
+        let (wg_tx, mut wg_rx) = mpsc::channel::<Vec<u8>>(1024);
+        let (in_tx, in_rx) = mpsc::channel::<Vec<u8>>(1024);
+        let mut seq_tx: u16 = 0;
+
+        let send_wg = move |datagram: Vec<u8>| -> crate::tun_datapath::BoxFut<'static, Result<(), TunnelError>> {
+            let tx = wg_tx.clone();
+            Box::pin(async move {
+                tx.send(datagram)
+                    .await
+                    .map_err(|_| TunnelError::Timeout("WG queue closed".into()))
+            })
+        };
+        let in_rx = Arc::new(tokio::sync::Mutex::new(in_rx));
+        let recv_wg = move || -> crate::tun_datapath::BoxFut<'static, Option<Vec<u8>>> {
+            let rx = in_rx.clone();
+            Box::pin(async move { rx.lock().await.recv().await })
+        };
+
+        let dp_cfg = crate::tun_datapath::TunDatapathConfig {
+            tun_name,
+            tun_mtu: self.config.tun_mtu,
+            persistent_keepalive: self.config.wg_keepalive,
+        };
+        let dp_cancel = cancel_rx.clone();
+        let datapath = tokio::spawn(async move {
+            crate::tun_datapath::run_tun_datapath(dp_cfg, engine, send_wg, recv_wg, dp_cancel).await
+        });
+
+        let mut cancel_rx = cancel_rx;
+        let result = loop {
+            tokio::select! {
+                biased;
+
+                _ = cancel_rx.changed() => {
+                    if *cancel_rx.borrow() {
+                        info!("TunnelClient TUN shutting down via cancel signal");
+                        break Ok(());
+                    }
+                }
+
+                _ = alloc_refresh_timer.tick() => {
+                    let requested_sec = stream_client.negotiated_lifetime();
+                    if let Err(e) = stream_client.refresh_allocation(requested_sec).await {
+                        warn!("Failed to refresh stream TURN allocation: {e}");
+                    }
+                }
+
+                _ = perm_refresh_timer.tick() => {
+                    if let Err(e) = stream_client.refresh_permission().await {
+                        warn!("Failed to refresh stream TURN permission: {e}");
+                    }
+                }
+
+                _ = chan_bind_refresh_timer.tick() => {
+                    if let Err(e) = stream_client.refresh_channel_bind().await {
+                        warn!("Failed to refresh stream TURN channel bind: {e}");
+                    }
+                }
+
+                Some(datagram) = wg_rx.recv() => {
+                    let mut frame = BytesMut::new();
+                    encode_frame(FrameType::Data, 0, 0, seq_tx, &datagram, &mut frame);
+                    seq_tx = seq_tx.wrapping_add(1);
+                    if let Err(e) = stream_client.send_channel_data(&frame).await {
+                        warn!("Failed to send ChannelData over stream: {e}");
+                    } else {
+                        self.metrics.record_tx(datagram.len());
+                    }
+                }
+
+                stream_msg_res = stream_client.recv_frame() => {
+                    match stream_msg_res {
+                        Ok(turn_incoming) => {
+                            let payload = match turn_incoming {
+                                TurnIncoming::ChannelData { payload, .. } => payload,
+                                TurnIncoming::DataIndication { payload, .. } => payload,
+                                _ => Bytes::new(),
+                            };
+                            if payload.is_empty() {
+                                continue;
+                            }
+                            if let Ok((view, _)) = FrameView::decode(&payload) {
+                                match view.header.frame_type {
+                                    FrameType::Data => {
+                                        self.metrics.record_rx(view.payload.len());
+                                        if in_tx.send(view.payload.to_vec()).await.is_err() {
+                                            warn!("TUN datapath closed, stopping");
+                                            break Ok(());
+                                        }
+                                    }
+                                    FrameType::HandshakeResp => {
+                                        info!("Pre-Auth handshake confirmed by server over stream!");
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            error!("StreamTurnClient error: {e}");
+                            break Err(TunnelError::Turn(e));
+                        }
+                    }
+                }
+            }
+        };
+
+        let _ = cancel_rx; // keep the receiver alive until shutdown
+        datapath.abort();
+        result
     }
 
     /// Run the client datapath until cancellation signal is received.

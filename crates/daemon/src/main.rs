@@ -33,6 +33,12 @@ struct ClientArgs {
     bind_iface: Option<String>,
     captcha_mode: CaptchaMode,
     ca_cert: Option<PathBuf>,
+    tun_name: Option<String>,
+    tun_mtu: u16,
+    wg_private_key: Option<String>,
+    wg_peer_public_key: Option<String>,
+    wg_preshared_key: Option<String>,
+    wg_keepalive: Option<u16>,
 }
 
 impl ClientArgs {
@@ -69,6 +75,12 @@ impl ClientArgs {
         let mut bind_iface = None;
         let mut captcha_mode = CaptchaMode::Helper;
         let mut ca_cert: Option<PathBuf> = None;
+        let mut tun_name: Option<String> = None;
+        let mut tun_mtu: u16 = 1360;
+        let mut wg_private_key: Option<String> = None;
+        let mut wg_peer_public_key: Option<String> = None;
+        let mut wg_preshared_key: Option<String> = None;
+        let mut wg_keepalive: Option<u16> = None;
 
         let mut i = 1;
         while i < args.len() {
@@ -268,6 +280,45 @@ impl ClientArgs {
                         _ => CaptchaMode::Helper,
                     };
                 }
+                "--tun" => {
+                    i += 1;
+                    tun_name = Some(args.get(i).ok_or("Missing value for --tun")?.clone());
+                }
+                "--tun-mtu" => {
+                    i += 1;
+                    tun_mtu = args
+                        .get(i)
+                        .ok_or("Missing value for --tun-mtu")?
+                        .parse()
+                        .map_err(|e| format!("Invalid --tun-mtu: {e}"))?;
+                }
+                "--wg-private-key" => {
+                    i += 1;
+                    wg_private_key = Some(read_key_arg(
+                        args.get(i).ok_or("Missing value for --wg-private-key")?,
+                    )?);
+                }
+                "--wg-peer-key" => {
+                    i += 1;
+                    wg_peer_public_key = Some(read_key_arg(
+                        args.get(i).ok_or("Missing value for --wg-peer-key")?,
+                    )?);
+                }
+                "--wg-psk" => {
+                    i += 1;
+                    wg_preshared_key = Some(read_key_arg(
+                        args.get(i).ok_or("Missing value for --wg-psk")?,
+                    )?);
+                }
+                "--wg-keepalive" => {
+                    i += 1;
+                    wg_keepalive = Some(
+                        args.get(i)
+                            .ok_or("Missing value for --wg-keepalive")?
+                            .parse()
+                            .map_err(|e| format!("Invalid --wg-keepalive: {e}"))?,
+                    );
+                }
                 "-h" | "--help" => {
                     println!(
                         "Usage: wdttd [OPTIONS] --server-relayed <ADDR:PORT>\n\n\
@@ -279,6 +330,12 @@ impl ClientArgs {
                            --transport <MODE>              TURN transport: udp (default), tcp, tls, auto\n  \
                            --sni <HOST>                    SNI hostname for TLS verification\n  \
                            --ca <PATH>                     Custom CA certificate (DER) for TLS verification\n  \
+                           --tun <NAME>                    Create a TUN interface and run WireGuard in-process\n  \
+                           --tun-mtu <N>                   TUN interface MTU (default: 1360)\n  \
+                           --wg-private-key <KEY|PATH>     Local WireGuard private key (base64 or file)\n  \
+                           --wg-peer-key <KEY|PATH>        Peer WireGuard public key (base64 or file)\n  \
+                           --wg-psk <KEY|PATH>             Optional WireGuard preshared key\n  \
+                           --wg-keepalive <SECS>           WireGuard persistent keepalive interval\n  \
                            --bind-iface <IFACE>            Bind outbound sockets to a network interface\n  \
                            --server-relayed <ADDR:PORT>    Remote server relayed address on TURN (required)\n  \
                            --wg-listen <ADDR:PORT>         Local WireGuard listening port (default: 127.0.0.1:51821)\n  \
@@ -327,7 +384,25 @@ impl ClientArgs {
             bind_iface,
             captcha_mode,
             ca_cert,
+            tun_name,
+            tun_mtu,
+            wg_private_key,
+            wg_peer_public_key,
+            wg_preshared_key,
+            wg_keepalive,
         })
+    }
+}
+
+/// Read a key argument: either the literal base64 value or a path to a file.
+fn read_key_arg(val: &str) -> Result<String, String> {
+    let path = std::path::Path::new(val);
+    if path.is_file() {
+        std::fs::read_to_string(path)
+            .map(|s| s.trim().to_string())
+            .map_err(|e| format!("Failed to read key file {val}: {e}"))
+    } else {
+        Ok(val.trim().to_string())
     }
 }
 
@@ -458,6 +533,12 @@ async fn async_main(mut args: ClientArgs) -> Result<(), Box<dyn std::error::Erro
             None => None,
         },
         bind_interface: args.bind_iface,
+        tun_name: args.tun_name,
+        tun_mtu: args.tun_mtu,
+        wg_private_key: args.wg_private_key,
+        wg_peer_public_key: args.wg_peer_public_key,
+        wg_preshared_key: args.wg_preshared_key,
+        wg_keepalive: args.wg_keepalive,
     };
 
     let mut client = TunnelClient::new(config);
