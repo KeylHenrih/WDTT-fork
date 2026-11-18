@@ -5,6 +5,7 @@
 use crate::batch::{BatchedUdpSocket, RecvMeta, TransmitPacket};
 use crate::keepalive::{AdaptiveKeepalive, AdaptiveKeepaliveConfig};
 use crate::metrics::TunnelMetrics;
+use crate::resilience::{Backoff, Recovery, classify};
 use bytes::{Bytes, BytesMut};
 use rand::RngCore;
 use std::collections::HashMap;
@@ -846,14 +847,7 @@ impl TunnelClient {
             tx_queue_capacity: 1024,
         };
 
-        let mut stream_client = StreamTurnClient::connect(stream_cfg).await?;
-        let my_relayed = stream_client.allocate_relay().await?;
-        info!("Client allocated relay address over stream: {my_relayed}");
-
-        stream_client
-            .bind_peer(self.config.server_relayed_addr)
-            .await?;
-        info!("Client bound peer {}", self.config.server_relayed_addr);
+        let (mut stream_client, my_relayed) = self.establish_stream(&stream_cfg).await?;
 
         let mut alloc_refresh_timer = tokio::time::interval_at(
             tokio::time::Instant::now() + stream_client.allocation_refresh_interval(),
@@ -867,31 +861,6 @@ impl TunnelClient {
             tokio::time::Instant::now() + stream_client.channel_bind_refresh_interval(),
             stream_client.channel_bind_refresh_interval(),
         );
-
-        let knock_key = derive_pre_auth_knock_key(&Psk::from_bytes(self.config.psk));
-        let auth = KnockAuthenticator::new(knock_key, DEFAULT_MAX_CLOCK_SKEW_SEC);
-        let now_sec = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
-        let mut client_nonce = [0u8; 16];
-        let mut session_id = [0u8; 16];
-        rand::rng().fill_bytes(&mut client_nonce);
-        rand::rng().fill_bytes(&mut session_id);
-
-        let knock_wire = auth.generate_knock_packet(now_sec, &client_nonce, &session_id, 32);
-        let mut knock_frame = BytesMut::new();
-        encode_frame(
-            FrameType::HandshakeInit,
-            0,
-            0,
-            0,
-            &knock_wire,
-            &mut knock_frame,
-        );
-        stream_client.send_channel_data(&knock_frame).await?;
-        info!("Pre-Auth knock sent to server over stream");
 
         if let Some(tx) = on_allocated {
             let _ = tx.send(my_relayed);
@@ -915,195 +884,269 @@ impl TunnelClient {
         let powersave_sleep = tokio::time::sleep_until(powersave_deadline);
         tokio::pin!(powersave_sleep);
 
-        loop {
-            tokio::select! {
-                biased;
+        let mut backoff = Backoff::default();
+        let mut shutting_down = false;
 
-                _ = cancel_rx.changed() => {
-                    if *cancel_rx.borrow() {
-                        info!("TunnelClient stream shutting down via cancel signal");
-                        break;
-                    }
-                }
+        'reconnect: loop {
+            let outcome: Result<(), TunnelError> = loop {
+                tokio::select! {
+                    biased;
 
-                _ = alloc_refresh_timer.tick() => {
-                    let requested_sec = stream_client.negotiated_lifetime();
-                    trace!("Stream TURN allocation refreshing ({requested_sec}s)");
-                    if let Err(e) = stream_client.refresh_allocation(requested_sec).await {
-                        warn!("Failed to refresh stream TURN allocation: {e}");
-                    }
-                }
-
-                _ = perm_refresh_timer.tick() => {
-                    trace!("Stream TURN permission refreshing");
-                    if let Err(e) = stream_client.refresh_permission().await {
-                        warn!("Failed to refresh stream TURN permission: {e}");
-                    }
-                }
-
-                _ = chan_bind_refresh_timer.tick() => {
-                    trace!("Stream TURN channel bind refreshing");
-                    if let Err(e) = stream_client.refresh_channel_bind().await {
-                        warn!("Failed to refresh stream TURN channel bind: {e}");
-                    }
-                }
-
-                _ = tick_timer.tick(), if !resequencer.is_empty() => {
-                    let mut timed_out = Vec::new();
-                    resequencer.tick(Instant::now(), &mut timed_out);
-                    if let Some(target) = wg_peer_addr {
-                        for pkt in timed_out {
-                            let _ = wg_socket.send_to(&pkt, target).await;
+                    _ = cancel_rx.changed() => {
+                        if *cancel_rx.borrow() {
+                            info!("TunnelClient stream shutting down via cancel signal");
+                            shutting_down = true;
+                            break Ok(());
                         }
                     }
-                }
 
-                () = &mut powersave_sleep, if self.config.keepalive_mode == KeepaliveMode::PowerSave => {
-                    let now = Instant::now();
-                    if adaptive_keepalive.has_pending_probe() {
-                        adaptive_keepalive.on_loss(now);
-                        powersave_deadline = tokio::time::Instant::now() + adaptive_keepalive.current_interval();
-                        powersave_sleep.as_mut().reset(powersave_deadline);
-                    } else {
-                        let now_ms = SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_millis() as u64;
-                        let probe_id = seq_tx;
-                        let ping = PingPayload {
-                            timestamp: now_ms,
-                            probe_id,
-                        };
-                        let mut pbuf = [0u8; PingPayload::LEN];
-                        ping.encode(&mut pbuf);
-                        let mut ping_frame = BytesMut::new();
-                        encode_frame(
-                            FrameType::Ping,
-                            0,
-                            0,
-                            probe_id,
-                            &pbuf,
-                            &mut ping_frame,
-                        );
-                        seq_tx = seq_tx.wrapping_add(1);
-                        if let Err(e) = stream_client.send_channel_data(&ping_frame).await {
-                            warn!("Failed to send Keepalive Ping over stream: {e}");
+                    _ = alloc_refresh_timer.tick() => {
+                        let requested_sec = stream_client.negotiated_lifetime();
+                        trace!("Stream TURN allocation refreshing ({requested_sec}s)");
+                        if let Err(e) = stream_client.refresh_allocation(requested_sec).await {
+                            warn!("Failed to refresh stream TURN allocation: {e}");
+                        }
+                    }
+
+                    _ = perm_refresh_timer.tick() => {
+                        trace!("Stream TURN permission refreshing");
+                        if let Err(e) = stream_client.refresh_permission().await {
+                            warn!("Failed to refresh stream TURN permission: {e}");
+                        }
+                    }
+
+                    _ = chan_bind_refresh_timer.tick() => {
+                        trace!("Stream TURN channel bind refreshing");
+                        if let Err(e) = stream_client.refresh_channel_bind().await {
+                            warn!("Failed to refresh stream TURN channel bind: {e}");
+                        }
+                    }
+
+                    _ = tick_timer.tick(), if !resequencer.is_empty() => {
+                        let mut timed_out = Vec::new();
+                        resequencer.tick(Instant::now(), &mut timed_out);
+                        if let Some(target) = wg_peer_addr {
+                            for pkt in timed_out {
+                                let _ = wg_socket.send_to(&pkt, target).await;
+                            }
+                        }
+                    }
+
+                    () = &mut powersave_sleep, if self.config.keepalive_mode == KeepaliveMode::PowerSave => {
+                        let now = Instant::now();
+                        if adaptive_keepalive.has_pending_probe() {
                             adaptive_keepalive.on_loss(now);
+                            powersave_deadline = tokio::time::Instant::now() + adaptive_keepalive.current_interval();
+                            powersave_sleep.as_mut().reset(powersave_deadline);
                         } else {
-                            self.metrics.record_ping_tx();
-                            adaptive_keepalive.record_probe_sent(probe_id, now);
+                            let now_ms = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis() as u64;
+                            let probe_id = seq_tx;
+                            let ping = PingPayload {
+                                timestamp: now_ms,
+                                probe_id,
+                            };
+                            let mut pbuf = [0u8; PingPayload::LEN];
+                            ping.encode(&mut pbuf);
+                            let mut ping_frame = BytesMut::new();
+                            encode_frame(
+                                FrameType::Ping,
+                                0,
+                                0,
+                                probe_id,
+                                &pbuf,
+                                &mut ping_frame,
+                            );
+                            seq_tx = seq_tx.wrapping_add(1);
+                            if let Err(e) = stream_client.send_channel_data(&ping_frame).await {
+                                warn!("Failed to send Keepalive Ping over stream: {e}");
+                                adaptive_keepalive.on_loss(now);
+                            } else {
+                                self.metrics.record_ping_tx();
+                                adaptive_keepalive.record_probe_sent(probe_id, now);
+                            }
+                            powersave_deadline = tokio::time::Instant::now() + adaptive_keepalive.current_interval();
+                            powersave_sleep.as_mut().reset(powersave_deadline);
                         }
-                        powersave_deadline = tokio::time::Instant::now() + adaptive_keepalive.current_interval();
-                        powersave_sleep.as_mut().reset(powersave_deadline);
                     }
-                }
 
-                // Packets from WireGuard -> send over stream
-                wg_batch_res = batched_wg.recv_batch(&mut wg_batch_bufs, &mut wg_batch_metas) => {
-                    match wg_batch_res {
-                        Ok(count) => {
-                            self.metrics.record_batch_rx(count);
-                            for i in 0..count {
-                                let meta = wg_batch_metas[i];
-                                wg_peer_addr = Some(meta.addr);
-                                let payload = &wg_batch_bufs[i][..meta.len];
+                    // Packets from WireGuard -> send over stream
+                    wg_batch_res = batched_wg.recv_batch(&mut wg_batch_bufs, &mut wg_batch_metas) => {
+                        match wg_batch_res {
+                            Ok(count) => {
+                                self.metrics.record_batch_rx(count);
+                                for i in 0..count {
+                                    let meta = wg_batch_metas[i];
+                                    wg_peer_addr = Some(meta.addr);
+                                    let payload = &wg_batch_bufs[i][..meta.len];
 
-                                let mut frame = BytesMut::new();
-                                encode_frame(FrameType::Data, 0, 0, seq_tx, payload, &mut frame);
-                                seq_tx = seq_tx.wrapping_add(1);
+                                    let mut frame = BytesMut::new();
+                                    encode_frame(FrameType::Data, 0, 0, seq_tx, payload, &mut frame);
+                                    seq_tx = seq_tx.wrapping_add(1);
 
-                                if let Err(e) = stream_client.send_channel_data(&frame).await {
-                                    warn!("Failed to send ChannelData over stream: {e}");
-                                } else {
-                                    self.metrics.record_tx(meta.len);
+                                    if let Err(e) = stream_client.send_channel_data(&frame).await {
+                                        warn!("Failed to send ChannelData over stream: {e}");
+                                    } else {
+                                        self.metrics.record_tx(meta.len);
+                                    }
                                 }
                             }
-                        }
-                        Err(e) => {
-                            trace!("WG recv_batch error: {e}");
+                            Err(e) => {
+                                trace!("WG recv_batch error: {e}");
+                            }
                         }
                     }
-                }
 
-                // Incoming frames from stream -> forward to WireGuard
-                stream_msg_res = stream_client.recv_frame() => {
-                    match stream_msg_res {
-                        Ok(turn_incoming) => {
-                            let payload = match turn_incoming {
-                                TurnIncoming::ChannelData { payload, .. } => payload,
-                                TurnIncoming::DataIndication { payload, .. } => payload,
-                                _ => bytes::Bytes::new(),
-                            };
+                    // Incoming frames from stream -> forward to WireGuard
+                    stream_msg_res = stream_client.recv_frame() => {
+                        match stream_msg_res {
+                            Ok(turn_incoming) => {
+                                let payload = match turn_incoming {
+                                    TurnIncoming::ChannelData { payload, .. } => payload,
+                                    TurnIncoming::DataIndication { payload, .. } => payload,
+                                    _ => bytes::Bytes::new(),
+                                };
 
-                            if payload.is_empty() {
-                                continue;
-                            }
+                                if payload.is_empty() {
+                                    continue;
+                                }
 
-                            if let Ok((view, _)) = FrameView::decode(&payload) {
-                                match view.header.frame_type {
-                                    FrameType::Data => {
-                                        let data_payload = view.payload;
-                                        adaptive_keepalive.on_rx_data(Instant::now());
-                                        self.metrics.record_rx(data_payload.len());
+                                if let Ok((view, _)) = FrameView::decode(&payload) {
+                                    match view.header.frame_type {
+                                        FrameType::Data => {
+                                            let data_payload = view.payload;
+                                            adaptive_keepalive.on_rx_data(Instant::now());
+                                            self.metrics.record_rx(data_payload.len());
 
-                                        if let Ok(wg_hdr) = inspect_wg_packet(data_payload) {
-                                            if wg_hdr.is_data()
-                                                && let (Some(rcv_idx), Some(counter)) =
-                                                    (wg_hdr.receiver_index, wg_hdr.counter)
-                                            {
-                                                let mut ordered = Vec::new();
-                                                resequencer.push(
-                                                    rcv_idx,
-                                                    counter,
-                                                    bytes::Bytes::copy_from_slice(data_payload),
-                                                    Instant::now(),
-                                                    &mut ordered,
-                                                );
-                                                if let Some(target) = wg_peer_addr {
-                                                    for pkt in ordered {
-                                                        let _ = wg_socket.send_to(&pkt, target).await;
+                                            if let Ok(wg_hdr) = inspect_wg_packet(data_payload) {
+                                                if wg_hdr.is_data()
+                                                    && let (Some(rcv_idx), Some(counter)) =
+                                                        (wg_hdr.receiver_index, wg_hdr.counter)
+                                                {
+                                                    let mut ordered = Vec::new();
+                                                    resequencer.push(
+                                                        rcv_idx,
+                                                        counter,
+                                                        bytes::Bytes::copy_from_slice(data_payload),
+                                                        Instant::now(),
+                                                        &mut ordered,
+                                                    );
+                                                    if let Some(target) = wg_peer_addr {
+                                                        for pkt in ordered {
+                                                            let _ = wg_socket.send_to(&pkt, target).await;
+                                                        }
                                                     }
+                                                } else if let Some(target) = wg_peer_addr {
+                                                    let _ = wg_socket.send_to(data_payload, target).await;
                                                 }
                                             } else if let Some(target) = wg_peer_addr {
                                                 let _ = wg_socket.send_to(data_payload, target).await;
                                             }
-                                        } else if let Some(target) = wg_peer_addr {
-                                            let _ = wg_socket.send_to(data_payload, target).await;
                                         }
-                                    }
-                                    FrameType::Pong => {
-                                        if let Ok(pong) = PongPayload::decode(view.payload) {
-                                            let now = Instant::now();
-                                            let now_ms = SystemTime::now()
-                                                .duration_since(UNIX_EPOCH)
-                                                .unwrap_or_default()
-                                                .as_millis() as u64;
-                                            let rtt = now_ms.saturating_sub(pong.echo_timestamp);
-                                            self.metrics.record_rtt_sample(rtt);
-                                            if adaptive_keepalive.on_pong(pong.probe_id, now) {
-                                                let confirmed_sec =
-                                                    adaptive_keepalive.confirmed_interval().as_secs();
-                                                self.metrics.record_confirmed_keepalive(confirmed_sec);
+                                        FrameType::Pong => {
+                                            if let Ok(pong) = PongPayload::decode(view.payload) {
+                                                let now = Instant::now();
+                                                let now_ms = SystemTime::now()
+                                                    .duration_since(UNIX_EPOCH)
+                                                    .unwrap_or_default()
+                                                    .as_millis() as u64;
+                                                let rtt = now_ms.saturating_sub(pong.echo_timestamp);
+                                                self.metrics.record_rtt_sample(rtt);
+                                                if adaptive_keepalive.on_pong(pong.probe_id, now) {
+                                                    let confirmed_sec =
+                                                        adaptive_keepalive.confirmed_interval().as_secs();
+                                                    self.metrics.record_confirmed_keepalive(confirmed_sec);
+                                                }
                                             }
                                         }
+                                        FrameType::HandshakeResp => {
+                                            info!("Pre-Auth handshake confirmed by server over stream!");
+                                        }
+                                        _ => {}
                                     }
-                                    FrameType::HandshakeResp => {
-                                        info!("Pre-Auth handshake confirmed by server over stream!");
-                                    }
-                                    _ => {}
                                 }
                             }
+                            Err(e) => {
+                                warn!("StreamTurnClient error: {e}");
+                                break Err(TunnelError::Turn(e));
+                            }
+                        }
+                    }
+                }
+            };
+
+            match outcome {
+                Ok(()) => {
+                    if shutting_down {
+                        return Ok(());
+                    }
+                    // The loop only ends cleanly on shutdown, so reaching here
+                    // without the flag means the datapath is gone.
+                    return Ok(());
+                }
+                Err(e) => {
+                    let text = e.to_string();
+                    if classify(&text) == Recovery::GiveUp {
+                        error!("Tunnel transport failed permanently: {text}");
+                        return Err(e);
+                    }
+
+                    let Some(delay) = backoff.next_delay() else {
+                        error!(
+                            "Giving up after {} reconnection attempts: {text}",
+                            backoff.attempts()
+                        );
+                        return Err(e);
+                    };
+
+                    warn!(
+                        "Tunnel transport lost ({text}); reconnecting in {:.1}s (attempt {})",
+                        delay.as_secs_f64(),
+                        backoff.attempts()
+                    );
+
+                    tokio::select! {
+                        _ = tokio::time::sleep(delay) => {}
+                        _ = cancel_rx.changed() => {
+                            if *cancel_rx.borrow() {
+                                info!("TunnelClient stream shutting down during reconnect");
+                                return Ok(());
+                            }
+                        }
+                    }
+
+                    match self.establish_stream(&stream_cfg).await {
+                        Ok((client, relayed)) => {
+                            stream_client = client;
+                            info!("Reconnected to TURN relay at {relayed}");
+                            alloc_refresh_timer = tokio::time::interval_at(
+                                tokio::time::Instant::now()
+                                    + stream_client.allocation_refresh_interval(),
+                                stream_client.allocation_refresh_interval(),
+                            );
+                            perm_refresh_timer = tokio::time::interval_at(
+                                tokio::time::Instant::now()
+                                    + stream_client.permission_refresh_interval(),
+                                stream_client.permission_refresh_interval(),
+                            );
+                            chan_bind_refresh_timer = tokio::time::interval_at(
+                                tokio::time::Instant::now()
+                                    + stream_client.channel_bind_refresh_interval(),
+                                stream_client.channel_bind_refresh_interval(),
+                            );
+                            backoff.reset();
+                            continue 'reconnect;
                         }
                         Err(e) => {
-                            error!("StreamTurnClient error: {e}");
-                            return Err(TunnelError::Turn(e));
+                            warn!("Reconnection attempt failed: {e}");
+                            continue 'reconnect;
                         }
                     }
                 }
             }
         }
-
-        Ok(())
     }
 
     /// Run the client datapath with a real TUN device and in-process WireGuard.
@@ -1160,39 +1203,7 @@ impl TunnelClient {
             tx_queue_capacity: 1024,
         };
 
-        let mut stream_client = StreamTurnClient::connect(stream_cfg).await?;
-        let my_relayed = stream_client.allocate_relay().await?;
-        info!("Client allocated relay address over stream: {my_relayed}");
-
-        stream_client
-            .bind_peer(self.config.server_relayed_addr)
-            .await?;
-        info!("Client bound peer {}", self.config.server_relayed_addr);
-
-        let knock_key = derive_pre_auth_knock_key(&Psk::from_bytes(self.config.psk));
-        let auth = KnockAuthenticator::new(knock_key, DEFAULT_MAX_CLOCK_SKEW_SEC);
-        let now_sec = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
-        let mut client_nonce = [0u8; 16];
-        let mut session_id = [0u8; 16];
-        rand::rng().fill_bytes(&mut client_nonce);
-        rand::rng().fill_bytes(&mut session_id);
-
-        let knock_wire = auth.generate_knock_packet(now_sec, &client_nonce, &session_id, 32);
-        let mut knock_frame = BytesMut::new();
-        encode_frame(
-            FrameType::HandshakeInit,
-            0,
-            0,
-            0,
-            &knock_wire,
-            &mut knock_frame,
-        );
-        stream_client.send_channel_data(&knock_frame).await?;
-        info!("Pre-Auth knock sent to server over stream");
+        let (mut stream_client, my_relayed) = self.establish_stream(&stream_cfg).await?;
 
         if let Some(tx) = on_allocated {
             let _ = tx.send(my_relayed);
@@ -1240,97 +1251,176 @@ impl TunnelClient {
         });
 
         let mut cancel_rx = cancel_rx;
+        let mut backoff = Backoff::default();
         let result = loop {
-            tokio::select! {
-                biased;
+            // The inner loop runs one connection's lifetime. A transport error
+            // breaks out of it with `Err`, and the outer loop decides whether
+            // to reconnect; a clean shutdown or a dead datapath breaks the
+            // outer loop directly.
+            let outcome: Result<(), TunnelError> = loop {
+                tokio::select! {
+                    biased;
 
-                _ = cancel_rx.changed() => {
-                    if *cancel_rx.borrow() {
-                        info!("TunnelClient TUN shutting down via cancel signal");
-                        break Ok(());
-                    }
-                }
-
-                // The datapath owns the TUN device. If it stops, the interface
-                // disappears with it, so surface the reason instead of letting
-                // the tunnel look alive while its device is gone.
-                dp_result = &mut datapath => {
-                    match dp_result {
-                        Ok(Ok(())) => {
-                            warn!("TUN datapath stopped");
+                    _ = cancel_rx.changed() => {
+                        if *cancel_rx.borrow() {
+                            info!("TunnelClient TUN shutting down via cancel signal");
                             break Ok(());
                         }
-                        Ok(Err(e)) => {
-                            error!("TUN datapath failed: {e}");
-                            break Err(e);
-                        }
-                        Err(e) => {
-                            error!("TUN datapath task panicked: {e}");
-                            break Err(TunnelError::Timeout(format!("TUN datapath task failed: {e}")));
-                        }
                     }
-                }
 
-                _ = alloc_refresh_timer.tick() => {
-                    let requested_sec = stream_client.negotiated_lifetime();
-                    if let Err(e) = stream_client.refresh_allocation(requested_sec).await {
-                        warn!("Failed to refresh stream TURN allocation: {e}");
-                    }
-                }
-
-                _ = perm_refresh_timer.tick() => {
-                    if let Err(e) = stream_client.refresh_permission().await {
-                        warn!("Failed to refresh stream TURN permission: {e}");
-                    }
-                }
-
-                _ = chan_bind_refresh_timer.tick() => {
-                    if let Err(e) = stream_client.refresh_channel_bind().await {
-                        warn!("Failed to refresh stream TURN channel bind: {e}");
-                    }
-                }
-
-                Some(datagram) = wg_rx.recv() => {
-                    let mut frame = BytesMut::new();
-                    encode_frame(FrameType::Data, 0, 0, seq_tx, &datagram, &mut frame);
-                    seq_tx = seq_tx.wrapping_add(1);
-                    if let Err(e) = stream_client.send_channel_data(&frame).await {
-                        warn!("Failed to send ChannelData over stream: {e}");
-                    } else {
-                        self.metrics.record_tx(datagram.len());
-                    }
-                }
-
-                stream_msg_res = stream_client.recv_frame() => {
-                    match stream_msg_res {
-                        Ok(turn_incoming) => {
-                            let payload = match turn_incoming {
-                                TurnIncoming::ChannelData { payload, .. } => payload,
-                                TurnIncoming::DataIndication { payload, .. } => payload,
-                                _ => Bytes::new(),
-                            };
-                            if payload.is_empty() {
-                                continue;
+                    // The datapath owns the TUN device. If it stops, the interface
+                    // disappears with it, so surface the reason instead of letting
+                    // the tunnel look alive while its device is gone.
+                    dp_result = &mut datapath => {
+                        match dp_result {
+                            Ok(Ok(())) => {
+                                warn!("TUN datapath stopped");
+                                break Ok(());
                             }
-                            if let Ok((view, _)) = FrameView::decode(&payload) {
-                                match view.header.frame_type {
-                                    FrameType::Data => {
-                                        self.metrics.record_rx(view.payload.len());
-                                        if in_tx.send(view.payload.to_vec()).await.is_err() {
-                                            warn!("TUN datapath closed, stopping");
-                                            break Ok(());
+                            Ok(Err(e)) => {
+                                error!("TUN datapath failed: {e}");
+                                break Err(e);
+                            }
+                            Err(e) => {
+                                error!("TUN datapath task panicked: {e}");
+                                break Err(TunnelError::Timeout(format!("TUN datapath task failed: {e}")));
+                            }
+                        }
+                    }
+
+                    _ = alloc_refresh_timer.tick() => {
+                        let requested_sec = stream_client.negotiated_lifetime();
+                        if let Err(e) = stream_client.refresh_allocation(requested_sec).await {
+                            warn!("Failed to refresh stream TURN allocation: {e}");
+                        }
+                    }
+
+                    _ = perm_refresh_timer.tick() => {
+                        if let Err(e) = stream_client.refresh_permission().await {
+                            warn!("Failed to refresh stream TURN permission: {e}");
+                        }
+                    }
+
+                    _ = chan_bind_refresh_timer.tick() => {
+                        if let Err(e) = stream_client.refresh_channel_bind().await {
+                            warn!("Failed to refresh stream TURN channel bind: {e}");
+                        }
+                    }
+
+                    Some(datagram) = wg_rx.recv() => {
+                        let mut frame = BytesMut::new();
+                        encode_frame(FrameType::Data, 0, 0, seq_tx, &datagram, &mut frame);
+                        seq_tx = seq_tx.wrapping_add(1);
+                        if let Err(e) = stream_client.send_channel_data(&frame).await {
+                            warn!("Failed to send ChannelData over stream: {e}");
+                        } else {
+                            self.metrics.record_tx(datagram.len());
+                        }
+                    }
+
+                    stream_msg_res = stream_client.recv_frame() => {
+                        match stream_msg_res {
+                            Ok(turn_incoming) => {
+                                let payload = match turn_incoming {
+                                    TurnIncoming::ChannelData { payload, .. } => payload,
+                                    TurnIncoming::DataIndication { payload, .. } => payload,
+                                    _ => Bytes::new(),
+                                };
+                                if payload.is_empty() {
+                                    continue;
+                                }
+                                if let Ok((view, _)) = FrameView::decode(&payload) {
+                                    match view.header.frame_type {
+                                        FrameType::Data => {
+                                            self.metrics.record_rx(view.payload.len());
+                                            if in_tx.send(view.payload.to_vec()).await.is_err() {
+                                                warn!("TUN datapath closed, stopping");
+                                                break Ok(());
+                                            }
                                         }
+                                        FrameType::HandshakeResp => {
+                                            info!("Pre-Auth handshake confirmed by server over stream!");
+                                        }
+                                        _ => {}
                                     }
-                                    FrameType::HandshakeResp => {
-                                        info!("Pre-Auth handshake confirmed by server over stream!");
-                                    }
-                                    _ => {}
                                 }
                             }
+                            Err(e) => {
+                                warn!("StreamTurnClient error: {e}");
+                                break Err(TunnelError::Turn(e));
+                            }
+                        }
+                    }
+                }
+            };
+
+            match outcome {
+                Ok(()) => break Ok(()),
+                Err(e) => {
+                    // A datapath failure is not something a new allocation can
+                    // fix: the TUN device is gone, so the tunnel is over.
+                    if matches!(e, TunnelError::Timeout(_)) {
+                        break Err(e);
+                    }
+
+                    let text = e.to_string();
+                    if classify(&text) == Recovery::GiveUp {
+                        error!("Tunnel transport failed permanently: {text}");
+                        break Err(e);
+                    }
+
+                    let Some(delay) = backoff.next_delay() else {
+                        error!(
+                            "Giving up after {} reconnection attempts: {text}",
+                            backoff.attempts()
+                        );
+                        break Err(e);
+                    };
+
+                    warn!(
+                        "Tunnel transport lost ({text}); reconnecting in {:.1}s (attempt {})",
+                        delay.as_secs_f64(),
+                        backoff.attempts()
+                    );
+
+                    // Wait out the backoff, but stay responsive to shutdown.
+                    tokio::select! {
+                        _ = tokio::time::sleep(delay) => {}
+                        _ = cancel_rx.changed() => {
+                            if *cancel_rx.borrow() {
+                                info!("TunnelClient TUN shutting down during reconnect");
+                                break Ok(());
+                            }
+                        }
+                    }
+
+                    match self.establish_stream(&stream_cfg).await {
+                        Ok((client, relayed)) => {
+                            stream_client = client;
+                            info!("Reconnected to TURN relay at {relayed}");
+
+                            // The refresh timers were scheduled against the old
+                            // allocation; restart them so they do not fire
+                            // immediately against the new one.
+                            alloc_refresh_timer = tokio::time::interval_at(
+                                tokio::time::Instant::now()
+                                    + stream_client.allocation_refresh_interval(),
+                                stream_client.allocation_refresh_interval(),
+                            );
+                            perm_refresh_timer = tokio::time::interval_at(
+                                tokio::time::Instant::now()
+                                    + stream_client.permission_refresh_interval(),
+                                stream_client.permission_refresh_interval(),
+                            );
+                            chan_bind_refresh_timer = tokio::time::interval_at(
+                                tokio::time::Instant::now()
+                                    + stream_client.channel_bind_refresh_interval(),
+                                stream_client.channel_bind_refresh_interval(),
+                            );
+                            backoff.reset();
                         }
                         Err(e) => {
-                            error!("StreamTurnClient error: {e}");
-                            break Err(TunnelError::Turn(e));
+                            warn!("Reconnection attempt failed: {e}");
                         }
                     }
                 }
@@ -1340,6 +1430,51 @@ impl TunnelClient {
         let _ = cancel_rx; // keep the receiver alive until shutdown
         datapath.abort();
         result
+    }
+
+    /// Establishes a stream TURN allocation and sends the pre-auth knock.
+    ///
+    /// Split out of [`Self::run_tun_with_notify`] so the datapath can call it
+    /// again after a transport failure without duplicating the handshake.
+    async fn establish_stream(
+        &self,
+        stream_cfg: &StreamClientConfig,
+    ) -> Result<(StreamTurnClient, SocketAddr), TunnelError> {
+        let mut stream_client = StreamTurnClient::connect(stream_cfg.clone()).await?;
+        let my_relayed = stream_client.allocate_relay().await?;
+        info!("Client allocated relay address over stream: {my_relayed}");
+
+        stream_client
+            .bind_peer(self.config.server_relayed_addr)
+            .await?;
+        info!("Client bound peer {}", self.config.server_relayed_addr);
+
+        let knock_key = derive_pre_auth_knock_key(&Psk::from_bytes(self.config.psk));
+        let auth = KnockAuthenticator::new(knock_key, DEFAULT_MAX_CLOCK_SKEW_SEC);
+        let now_sec = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let mut client_nonce = [0u8; 16];
+        let mut session_id = [0u8; 16];
+        rand::rng().fill_bytes(&mut client_nonce);
+        rand::rng().fill_bytes(&mut session_id);
+
+        let knock_wire = auth.generate_knock_packet(now_sec, &client_nonce, &session_id, 32);
+        let mut knock_frame = BytesMut::new();
+        encode_frame(
+            FrameType::HandshakeInit,
+            0,
+            0,
+            0,
+            &knock_wire,
+            &mut knock_frame,
+        );
+        stream_client.send_channel_data(&knock_frame).await?;
+        info!("Pre-Auth knock sent to server over stream");
+
+        Ok((stream_client, my_relayed))
     }
 
     /// Run the client datapath until cancellation signal is received.

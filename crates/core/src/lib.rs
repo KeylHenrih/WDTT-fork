@@ -6,6 +6,7 @@
 pub mod batch;
 pub mod keepalive;
 pub mod metrics;
+pub mod resilience;
 pub mod tun_datapath;
 pub mod tunnel;
 
@@ -14,6 +15,7 @@ pub use batch::{
 };
 pub use keepalive::{AdaptiveKeepalive, AdaptiveKeepaliveConfig, KeepaliveNetworkCache, NetworkId};
 pub use metrics::{MetricsSnapshot, TunnelMetrics};
+pub use resilience::{Backoff, Recovery, classify};
 pub use tunnel::{
     DirectSessionWorker, KeepaliveMode, StreamSessionWorker, TunnelClient, TunnelClientConfig,
     TunnelError, TunnelServer, TunnelServerConfig,
