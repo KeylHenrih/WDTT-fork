@@ -2,13 +2,19 @@
 
 #![forbid(unsafe_code)]
 
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::sync::watch;
 use tracing::{error, info, warn};
 use wdtt_core::{KeepaliveMode, TunnelClient, TunnelClientConfig, TurnTransportMode};
 use wdtt_provider::{CaptchaMode, TurnProvider, VkTurnProvider};
+#[cfg(target_os = "linux")]
+use wdtt_tun::geo::download::{GeoDownloader, GeoFiles};
+#[cfg(target_os = "linux")]
+use wdtt_tun::setup::{self, HostSetup, HostSetupConfig};
+#[cfg(target_os = "linux")]
+use wdtt_tun::{Routing, RoutingTable};
 
 const DEFAULT_EARLIEST_VK_TIME: u64 = 1794734520; // 15:22:00 +06:00
 
@@ -35,6 +41,14 @@ struct ClientArgs {
     ca_cert: Option<PathBuf>,
     tun_name: Option<String>,
     tun_mtu: u16,
+    route_rules: Option<PathBuf>,
+    geo_dir: Option<PathBuf>,
+    route_tun_addr: Option<Ipv4Addr>,
+    route_relay: Option<Ipv4Addr>,
+    route_phys: Option<String>,
+    route_gw: Option<Ipv4Addr>,
+    no_kill_switch: bool,
+    no_dns: bool,
     wg_private_key: Option<String>,
     wg_peer_public_key: Option<String>,
     wg_preshared_key: Option<String>,
@@ -77,6 +91,14 @@ impl ClientArgs {
         let mut ca_cert: Option<PathBuf> = None;
         let mut tun_name: Option<String> = None;
         let mut tun_mtu: u16 = 1360;
+        let mut route_rules: Option<PathBuf> = None;
+        let mut geo_dir: Option<PathBuf> = None;
+        let mut route_tun_addr: Option<Ipv4Addr> = None;
+        let mut route_relay: Option<Ipv4Addr> = None;
+        let mut route_phys: Option<String> = None;
+        let mut route_gw: Option<Ipv4Addr> = None;
+        let mut no_kill_switch = false;
+        let mut no_dns = false;
         let mut wg_private_key: Option<String> = None;
         let mut wg_peer_public_key: Option<String> = None;
         let mut wg_preshared_key: Option<String> = None;
@@ -292,6 +314,55 @@ impl ClientArgs {
                         .parse()
                         .map_err(|e| format!("Invalid --tun-mtu: {e}"))?;
                 }
+                "--route-rules" => {
+                    i += 1;
+                    route_rules = Some(PathBuf::from(
+                        args.get(i).ok_or("Missing value for --route-rules")?,
+                    ));
+                }
+                "--geo-dir" => {
+                    i += 1;
+                    geo_dir = Some(PathBuf::from(
+                        args.get(i).ok_or("Missing value for --geo-dir")?,
+                    ));
+                }
+                "--route-tun-addr" => {
+                    i += 1;
+                    route_tun_addr = Some(
+                        args.get(i)
+                            .ok_or("Missing value for --route-tun-addr")?
+                            .parse()
+                            .map_err(|e| format!("Invalid --route-tun-addr: {e}"))?,
+                    );
+                }
+                "--route-relay" => {
+                    i += 1;
+                    route_relay = Some(
+                        args.get(i)
+                            .ok_or("Missing value for --route-relay")?
+                            .parse()
+                            .map_err(|e| format!("Invalid --route-relay: {e}"))?,
+                    );
+                }
+                "--route-phys" => {
+                    i += 1;
+                    route_phys = Some(args.get(i).ok_or("Missing value for --route-phys")?.clone());
+                }
+                "--route-gw" => {
+                    i += 1;
+                    route_gw = Some(
+                        args.get(i)
+                            .ok_or("Missing value for --route-gw")?
+                            .parse()
+                            .map_err(|e| format!("Invalid --route-gw: {e}"))?,
+                    );
+                }
+                "--no-kill-switch" => {
+                    no_kill_switch = true;
+                }
+                "--no-dns" => {
+                    no_dns = true;
+                }
                 "--wg-private-key" => {
                     i += 1;
                     wg_private_key = Some(read_key_arg(
@@ -332,6 +403,14 @@ impl ClientArgs {
                            --ca <PATH>                     Custom CA certificate (DER) for TLS verification\n  \
                            --tun <NAME>                    Create a TUN interface and run WireGuard in-process\n  \
                            --tun-mtu <N>                   TUN interface MTU (default: 1360)\n  \
+                           --route-rules <PATH>            Xray-format routing rules (JSON) to apply\n  \
+                           --geo-dir <PATH>                Directory for cached geoip.dat / geosite.dat\n  \
+                           --route-tun-addr <ADDR>         Address to assign to the TUN interface\n  \
+                           --route-relay <ADDR>            TURN relay address (bypass route target)\n  \
+                           --route-phys <IFACE>            Physical interface carrying relay traffic\n  \
+                           --route-gw <ADDR>               Physical gateway for the relay bypass route\n  \
+                           --no-kill-switch                Do not install the kill-switch\n  \
+                           --no-dns                        Do not switch the system resolver\n  \
                            --wg-private-key <KEY|PATH>     Local WireGuard private key (base64 or file)\n  \
                            --wg-peer-key <KEY|PATH>        Peer WireGuard public key (base64 or file)\n  \
                            --wg-psk <KEY|PATH>             Optional WireGuard preshared key\n  \
@@ -386,6 +465,14 @@ impl ClientArgs {
             ca_cert,
             tun_name,
             tun_mtu,
+            route_rules,
+            geo_dir,
+            route_tun_addr,
+            route_relay,
+            route_phys,
+            route_gw,
+            no_kill_switch,
+            no_dns,
             wg_private_key,
             wg_peer_public_key,
             wg_preshared_key,
@@ -513,6 +600,22 @@ async fn async_main(mut args: ClientArgs) -> Result<(), Box<dyn std::error::Erro
         args.runtime, args.workers
     );
 
+    // Stage 3.6: the host-side configuration is applied after the TUN device
+    // exists, which happens inside the client task. See below. The fields it
+    // needs are captured here because building the config below moves `args`.
+    #[cfg(target_os = "linux")]
+    let setup_args = SetupArgs {
+        tun_name: args.tun_name.clone(),
+        route_rules: args.route_rules.clone(),
+        geo_dir: args.geo_dir.clone(),
+        route_tun_addr: args.route_tun_addr,
+        route_relay: args.route_relay,
+        route_phys: args.route_phys.clone(),
+        route_gw: args.route_gw,
+        no_kill_switch: args.no_kill_switch,
+        no_dns: args.no_dns,
+    };
+
     let config = TunnelClientConfig {
         turn_server_addr: turn_server,
         turn_username: args.turn_username,
@@ -563,6 +666,18 @@ async fn async_main(mut args: ClientArgs) -> Result<(), Box<dyn std::error::Erro
         }
     }
 
+    // Stage 3.6: the TUN device is created inside the client task, so the
+    // host-side configuration can only be applied once it exists.
+    #[cfg(target_os = "linux")]
+    let mut host_setup = match prepare_host_setup(&setup_args, turn_server).await {
+        Ok(setup) => setup,
+        Err(err) => {
+            error!("{err}");
+            let _ = cancel_tx.send(true);
+            return Err(err.into());
+        }
+    };
+
     // Wait for Ctrl+C
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
@@ -590,7 +705,161 @@ async fn async_main(mut args: ClientArgs) -> Result<(), Box<dyn std::error::Erro
         snap.rtt_latest_ms
     );
 
+    // Undo the host-side configuration in reverse order.
+    #[cfg(target_os = "linux")]
+    if let Some(ref mut setup) = host_setup {
+        info!("Restoring host network configuration...");
+        setup.teardown().await;
+        info!("Host network configuration restored");
+    }
+
     Ok(())
+}
+
+/// Waits until a network interface exists and is reachable through the ioctl
+/// path, up to a few seconds.
+///
+/// `if_nametoindex` alone is not enough: it resolves through `/sys`, which can
+/// report a device the kernel has already torn down. The ioctl path is what
+/// the setup actually uses, so it is what we wait for.
+#[cfg(target_os = "linux")]
+async fn wait_for_interface(name: &str) -> Result<(), String> {
+    for _ in 0..50 {
+        if wdtt_tun::netcfg::interface_is_live(name) {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Err(format!("Interface {name} did not appear within 5 seconds"))
+}
+
+/// Builds and applies the host-side tunnel configuration.
+///
+/// Parses a routing section from either a bare object or a full Xray config.
+///
+/// A bare `Routing` object is accepted directly. A full Xray config, which
+/// wraps the section in a top-level `"routing"` key, is unwrapped first, so an
+/// existing Xray configuration file can be pointed at with `--route-rules`
+/// without editing.
+#[cfg(target_os = "linux")]
+fn parse_routing(raw: &str) -> Result<Routing, serde_json::Error> {
+    let value: serde_json::Value = serde_json::from_str(raw)?;
+    let section = match value.get("routing") {
+        Some(inner) => inner.clone(),
+        None => value,
+    };
+    serde_json::from_value(section)
+}
+
+/// The subset of client arguments the host setup needs.
+///
+/// Captured before the tunnel config is built, because building it moves the
+/// original argument struct.
+#[cfg(target_os = "linux")]
+struct SetupArgs {
+    tun_name: Option<String>,
+    route_rules: Option<PathBuf>,
+    geo_dir: Option<PathBuf>,
+    route_tun_addr: Option<Ipv4Addr>,
+    route_relay: Option<Ipv4Addr>,
+    route_phys: Option<String>,
+    route_gw: Option<Ipv4Addr>,
+    no_kill_switch: bool,
+    no_dns: bool,
+}
+
+/// Returns `None` when the daemon was not asked to manage routing (no
+/// `--route-rules` and no `--tun`), so a plain bridge run is unaffected.
+#[cfg(target_os = "linux")]
+async fn prepare_host_setup(
+    args: &SetupArgs,
+    turn_server: SocketAddr,
+) -> Result<Option<HostSetup>, String> {
+    let Some(ref tun_name) = args.tun_name else {
+        return Ok(None);
+    };
+
+    // Without an explicit address there is nothing to configure; the caller is
+    // expected to set the interface up by hand, as before.
+    let Some(tun_addr) = args.route_tun_addr else {
+        if args.route_rules.is_some() {
+            return Err("--route-rules requires --route-tun-addr".into());
+        }
+        return Ok(None);
+    };
+
+    let relay = args.route_relay.unwrap_or_else(|| {
+        turn_server
+            .ip()
+            .to_string()
+            .parse()
+            .unwrap_or(Ipv4Addr::UNSPECIFIED)
+    });
+    let phys = args
+        .route_phys
+        .clone()
+        .ok_or("--route-tun-addr requires --route-phys <IFACE>")?;
+
+    let mut cfg = HostSetupConfig::new(tun_name.clone(), tun_addr, relay, phys);
+    cfg.physical_gateway = args.route_gw;
+    cfg.kill_switch = !args.no_kill_switch;
+    cfg.dns = !args.no_dns;
+
+    // Compile the routing rules, if any were given.
+    if let Some(ref rules_path) = args.route_rules {
+        let raw = std::fs::read_to_string(rules_path)
+            .map_err(|e| format!("Failed to read routing rules {rules_path:?}: {e}"))?;
+        let routing = parse_routing(&raw)
+            .map_err(|e| format!("Failed to parse routing rules {rules_path:?}: {e}"))?;
+
+        let geo_dir = args
+            .geo_dir
+            .clone()
+            .unwrap_or_else(setup::default_cache_dir);
+        let downloader = GeoDownloader::new(GeoFiles::under(&geo_dir));
+        let geo = downloader
+            .load()
+            .await
+            .map_err(|e| format!("Failed to load geo data from {geo_dir:?}: {e}"))?;
+        info!(
+            "Geo data loaded: {} ip categories, {} domain categories",
+            geo.ip_categories().len(),
+            geo.domain_categories().len()
+        );
+
+        let table = RoutingTable::compile(&routing, &geo)
+            .map_err(|e| format!("Failed to compile routing rules: {e}"))?;
+        info!("Compiled {} routing rules", table.rules().len());
+
+        let resolver_cfg = wdtt_tun::resolver::ResolverConfig {
+            cache_path: Some(wdtt_tun::resolver::default_cache_path(&geo_dir)),
+            ..Default::default()
+        };
+        let (ruleset, _addresses) = setup::prepare_ruleset(&table, resolver_cfg).await;
+        for approx in &ruleset.approximations {
+            warn!("Rule {} is approximated: {}", approx.index, approx.detail);
+        }
+        info!("Compiled {} mark rules", ruleset.rules.len());
+        cfg.ruleset = ruleset;
+    }
+
+    // The TUN device is created by the client task; wait briefly for it to
+    // appear before touching it, since the notify fires before the device is
+    // necessarily visible to the kernel.
+    wait_for_interface(tun_name).await?;
+
+    let mut setup = HostSetup::new(cfg);
+    setup
+        .apply()
+        .await
+        .map_err(|e| format!("Failed to configure host networking: {e}"))?;
+    info!(
+        "Host networking configured: address, policy routing, {} mark rules, dns={}, kill-switch={}",
+        setup.config().ruleset.rules.len(),
+        setup.config().dns,
+        setup.config().kill_switch
+    );
+    Ok(Some(setup))
 }
 
 async fn check_vk_turn_udp(host: &str, bind_iface: Option<&str>) {

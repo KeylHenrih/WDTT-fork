@@ -1235,7 +1235,7 @@ impl TunnelClient {
             persistent_keepalive: self.config.wg_keepalive,
         };
         let dp_cancel = cancel_rx.clone();
-        let datapath = tokio::spawn(async move {
+        let mut datapath = tokio::spawn(async move {
             crate::tun_datapath::run_tun_datapath(dp_cfg, engine, send_wg, recv_wg, dp_cancel).await
         });
 
@@ -1248,6 +1248,26 @@ impl TunnelClient {
                     if *cancel_rx.borrow() {
                         info!("TunnelClient TUN shutting down via cancel signal");
                         break Ok(());
+                    }
+                }
+
+                // The datapath owns the TUN device. If it stops, the interface
+                // disappears with it, so surface the reason instead of letting
+                // the tunnel look alive while its device is gone.
+                dp_result = &mut datapath => {
+                    match dp_result {
+                        Ok(Ok(())) => {
+                            warn!("TUN datapath stopped");
+                            break Ok(());
+                        }
+                        Ok(Err(e)) => {
+                            error!("TUN datapath failed: {e}");
+                            break Err(e);
+                        }
+                        Err(e) => {
+                            error!("TUN datapath task panicked: {e}");
+                            break Err(TunnelError::Timeout(format!("TUN datapath task failed: {e}")));
+                        }
                     }
                 }
 

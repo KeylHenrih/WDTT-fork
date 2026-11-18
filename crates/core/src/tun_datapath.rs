@@ -10,7 +10,7 @@ use std::net::IpAddr;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::watch;
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 use wdtt_tun::{DATA_OVERHEAD_SZ, HANDSHAKE_INIT_SZ, TunDevice, WgEngine, WgOutput};
 
 /// Largest IP packet the TUN side may hand us (MTU + IPv6 header slack).
@@ -63,7 +63,11 @@ where
 
     // Kick off the handshake immediately rather than waiting for first traffic.
     let init = engine.initiate_handshake(&mut wg_out)?;
-    ship(init, &mut send_wg).await?;
+    if let Err(e) = ship(init, &mut send_wg).await {
+        error!("TUN datapath: initial handshake send failed: {e}");
+        return Err(e);
+    }
+    info!("TUN datapath: initial handshake sent, entering loop");
 
     loop {
         tokio::select! {

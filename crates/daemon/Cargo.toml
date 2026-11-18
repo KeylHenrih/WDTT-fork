@@ -20,3 +20,7 @@ wdtt-core = { workspace = true }
 wdtt-crypto = { workspace = true }
 wdtt-provider = { workspace = true }
 socket2 = { workspace = true }
+serde_json = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+wdtt-tun = { workspace = true }

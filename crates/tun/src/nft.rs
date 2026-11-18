@@ -151,15 +151,32 @@ pub fn compile_ruleset(
         }
         let matcher = &rule.matcher;
 
-        let mut dest_v4: Vec<Cidr> = matcher.ip.cidrs().to_vec();
+        // Only IPv4 is projected: the generated set is `type ipv4_addr`, and a
+        // `geoip:` category routinely carries IPv6 ranges alongside IPv4 ones.
+        // Mixing them makes nft reject the whole set.
+        let ipv6_dropped = matcher.ip.cidrs().iter().any(|c| c.addr.is_ipv6());
+        let mut dest_v4: Vec<Cidr> = matcher
+            .ip
+            .cidrs()
+            .iter()
+            .filter(|c| c.addr.is_ipv4())
+            .cloned()
+            .collect();
         let has_domain = !matcher.domain.is_empty();
 
         if has_domain {
             match resolved.get(&rule.index) {
                 Some(addrs) if !addrs.is_empty() => {
-                    dest_v4.extend(addrs.iter().map(|ip| Cidr {
+                    if addrs.iter().any(|ip| ip.is_ipv6()) {
+                        out.approximations.push(Approximation {
+                            index: rule.index,
+                            detail: "IPv6 addresses are not tunnelled; only IPv4 is routed"
+                                .to_owned(),
+                        });
+                    }
+                    dest_v4.extend(addrs.iter().filter(|ip| ip.is_ipv4()).map(|ip| Cidr {
                         addr: *ip,
-                        prefix: if ip.is_ipv4() { 32 } else { 128 },
+                        prefix: 32,
                     }));
                 }
                 _ => {
@@ -171,6 +188,13 @@ pub fn compile_ruleset(
                     continue;
                 }
             }
+        }
+
+        if ipv6_dropped {
+            out.approximations.push(Approximation {
+                index: rule.index,
+                detail: "IPv6 addresses are not tunnelled; only IPv4 is routed".to_owned(),
+            });
         }
 
         if has_domain && !matcher.ip.is_empty() {
@@ -541,6 +565,43 @@ mod tests {
             prefix: 32,
         };
         assert_eq!(render_cidr(&cidr), "8.8.8.8");
+    }
+
+    #[test]
+    fn ipv6_cidrs_are_dropped_from_the_ipv4_set() {
+        // A `geoip:` category carries IPv6 ranges alongside IPv4 ones. The
+        // generated set is `type ipv4_addr`, so an IPv6 element makes nft
+        // reject the whole set with "Address family for hostname not
+        // supported". Only IPv4 may reach the set.
+        let table = table_from_json(
+            r#"{"rules":[{"ip":["1.1.1.0/24","2001:db8::/32","8.8.8.8"],"outboundTag":"proxy"}]}"#,
+        );
+        let ruleset = compile_ruleset(&table, &std::collections::HashMap::new());
+        let rendered: Vec<String> = ruleset.rules[0].dest_v4.iter().map(render_cidr).collect();
+        assert_eq!(rendered, vec!["1.1.1.0/24", "8.8.8.8"]);
+
+        let script = render_ruleset(&ruleset);
+        assert!(
+            !script.contains("2001:db8"),
+            "IPv6 leaked into the set:\n{script}"
+        );
+    }
+
+    #[test]
+    fn resolved_ipv6_addresses_are_dropped_too() {
+        let table =
+            table_from_json(r#"{"rules":[{"domain":["full:example.com"],"outboundTag":"proxy"}]}"#);
+        let mut resolved = std::collections::HashMap::new();
+        resolved.insert(
+            0usize,
+            vec![
+                "93.184.216.34".parse().unwrap(),
+                "2606:2800:220:1:248:1893:25c8:1946".parse().unwrap(),
+            ],
+        );
+        let ruleset = compile_ruleset(&table, &resolved);
+        let rendered: Vec<String> = ruleset.rules[0].dest_v4.iter().map(render_cidr).collect();
+        assert_eq!(rendered, vec!["93.184.216.34"]);
     }
 
     #[test]

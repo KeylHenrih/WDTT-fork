@@ -174,6 +174,25 @@ pub fn set_netmask(name: &str, mask: Ipv4Addr) -> Result<(), TunError> {
 }
 
 /// Bring an interface up via `SIOCGIFFLAGS` + `SIOCSIFFLAGS`.
+/// Reports whether an interface is reachable through the ioctl path.
+///
+/// This is deliberately not `if_nametoindex`: that resolves through `/sys`,
+/// which can still list a device the kernel has already torn down. A
+/// `SIOCGIFFLAGS` round trip is the same path the setup itself uses, so a
+/// success here means the following calls will work too.
+pub fn interface_is_live(name: &str) -> bool {
+    let Ok(sock) = control_socket() else {
+        return false;
+    };
+    let Ok(mut ifr) = ifreq_with_name(name) else {
+        return false;
+    };
+
+    // SAFETY: `ifr` is a valid `ifreq` with a NUL-terminated name.
+    unsafe { libc::ioctl(sock.as_raw_fd(), libc::SIOCGIFFLAGS, &mut ifr) == 0 }
+}
+
+/// Bring an interface up via `SIOCGIFFLAGS` + `SIOCSIFFLAGS`.
 pub fn set_up(name: &str) -> Result<(), TunError> {
     let sock = control_socket()?;
     let mut ifr = ifreq_with_name(name)?;

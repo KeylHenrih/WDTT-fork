@@ -3621,6 +3621,7 @@ dependencies = [
 name = "wdttd"
 version = "0.1.0"
 dependencies = [
+ "serde_json",
  "socket2 0.5.10",
  "thiserror 2.0.21",
  "tokio",
@@ -3630,6 +3631,7 @@ dependencies = [
  "wdtt-crypto",
  "wdtt-proto",
  "wdtt-provider",
+ "wdtt-tun",
 ]
 
 [[package]]

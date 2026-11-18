@@ -19,6 +19,8 @@ pub mod netlink;
 pub mod nft;
 pub mod resolver;
 pub mod routing;
+#[cfg(target_os = "linux")]
+pub mod setup;
 pub mod wg;
 
 pub use dns::{DnsServer, DnsServerConfig, ResolverBackend, ResolverError, SystemResolver};
@@ -33,6 +35,8 @@ pub use netlink::{NlRouteSpec, RuleSpec};
 pub use routing::{
     ConnectionInfo, Outbound, Routing, RoutingError, RoutingTable, Rule, RuleMatcher,
 };
+#[cfg(target_os = "linux")]
+pub use setup::{HostSetup, HostSetupConfig, SetupError, prepare_ruleset};
 pub use wg::{DATA_OVERHEAD_SZ, HANDSHAKE_INIT_SZ, HANDSHAKE_RESP_SZ, WgEngine, WgError, WgOutput};
 
 /// Virtual packet buffer type for TUN payload exchange.
