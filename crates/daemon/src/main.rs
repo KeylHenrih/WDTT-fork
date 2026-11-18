@@ -164,10 +164,10 @@ impl ClientArgs {
                 "--psk" => {
                     i += 1;
                     let val = args.get(i).ok_or("Missing value for --psk")?;
-                    let bytes = val.as_bytes();
-                    for (dst, src) in psk.iter_mut().zip(bytes.iter()) {
-                        *dst = *src;
-                    }
+                    psk = wdtt_crypto::Psk::parse(val)
+                        .map_err(|e| format!("Invalid --psk: {e}"))?
+                        .as_bytes()
+                        .to_owned();
                 }
                 "--keepalive" => {
                     i += 1;
@@ -275,7 +275,7 @@ impl ClientArgs {
                            --bind-iface <IFACE>            Bind outbound sockets to a network interface\n  \
                            --server-relayed <ADDR:PORT>    Remote server relayed address on TURN (required)\n  \
                            --wg-listen <ADDR:PORT>         Local WireGuard listening port (default: 127.0.0.1:51821)\n  \
-                           --psk <STRING>                  Pre-shared key for knock authentication\n  \
+                           --psk <HEX>                     Pre-shared key: 64 hex chars (or raw 32-byte string)\n  \
                            --keepalive <MODE>              Keepalive mode: powersave (default), chaff, disabled\n  \
                            --coalesce-ms <MS>              Coalesce window for outbound datagrams (0 = off)\n  \
                            --profile <NAME>                Provider profile (default: vk)\n  \

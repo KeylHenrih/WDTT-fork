@@ -111,10 +111,10 @@ impl ServerArgs {
                 "--psk" => {
                     i += 1;
                     let val = args.get(i).ok_or("Missing value for --psk")?;
-                    let bytes = val.as_bytes();
-                    for (dst, src) in psk.iter_mut().zip(bytes.iter()) {
-                        *dst = *src;
-                    }
+                    psk = wdtt_crypto::Psk::parse(val)
+                        .map_err(|e| format!("Invalid --psk: {e}"))?
+                        .as_bytes()
+                        .to_owned();
                 }
                 "--relayed-addr-file" => {
                     i += 1;
@@ -159,7 +159,7 @@ impl ServerArgs {
                            --turn-pass <PASS>           TURN password (default: pass)\n  \
                            --turn-realm <REALM>         TURN realm (default: coturn)\n  \
                            --wg-endpoint <ADDR:PORT>    Local WireGuard endpoint (default: 127.0.0.1:51820)\n  \
-                           --psk <STRING>               Pre-shared key for knock authentication\n  \
+                           --psk <HEX>                  Pre-shared key: 64 hex chars (or raw 32-byte string)\n  \
                            --relayed-addr-file <PATH>   Write allocated TURN relay address to file\n  \
                            --runtime <MODE>             Tokio runtime: multi_thread (default), current_thread\n  \
                            --workers <N>                Worker threads for multi_thread runtime (default: 2)\n"

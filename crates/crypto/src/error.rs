@@ -15,6 +15,9 @@ pub enum CryptoError {
     #[error("invalid nonce length: expected {expected} bytes, got {actual}")]
     InvalidNonceLength { expected: usize, actual: usize },
 
+    #[error("invalid hex encoding: {0}")]
+    InvalidHex(String),
+
     #[error(
         "replay detected: packet counter {counter} has already been seen or is outside anti-replay window"
     )]
