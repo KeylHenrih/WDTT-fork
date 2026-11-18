@@ -4,7 +4,7 @@
 [![License: GPL-3.0](https://img.shields.io/badge/License-GPL--3.0-blue.svg)](LICENSE)
 [![Rust: 2024](https://img.shields.io/badge/Rust-2024-orange.svg)](Cargo.toml)
 
-**WDTT (`wdtt-rs`)** is an open-source network tunneling ecosystem designed to encapsulate standard WireGuard traffic into multimedia WebRTC call protocols (TURN/DTLS or RTP) to traverse restricted network environments with high packet loss and strict UDP filtering. The project **is not** an anonymity tool (such as Tor), does not provide public servers, does not conceal your traffic volume from your endpoint provider, and provides no guarantees of unblockable circumvention: it is a modular network transport mechanism connecting your personal client device to your private server via an intermediate relay.
+**WDTT (`wdtt-rs`)** is an open-source network tunneling ecosystem designed to encapsulate standard WireGuard traffic into multimedia WebRTC call protocols (TURN over TCP/TLS, ChannelData) to traverse restricted network environments with high packet loss and strict UDP filtering. The project **is not** an anonymity tool (such as Tor), does not provide public servers, does not conceal your traffic volume from your endpoint provider, and provides no guarantees of unblockable circumvention: it is a modular network transport mechanism connecting your personal client device to your private server via an intermediate relay.
 
 ---
 
@@ -20,15 +20,15 @@ In mobile cellular networks and public Wi-Fi access points, standard WireGuard U
 flowchart LR
     A["User Applications"] --> B["WireGuard (TUN)"]
     B --> C["WDTT Client (wdttd)"]
-    C -- "DTLS / RTP over TURN (0x4000)" --> D["TURN Relay (coturn / WebRTC)"]
+    C -- "TURN over TCP/TLS, ChannelData 0x4000" --> D["TURN Relay (coturn / WebRTC)"]
     D -- "Relayed UDP" --> E["WDTT Server (wdtt-server)"]
-    E --> F["WireGuard Server (wg0)"]
+    E --> F["WireGuard Server (wg-vk0)"]
     F --> G["Internet"]
 ```
 
 ### Participant Visibility:
-- **Network Observer (Provider DPI):** Observes a standard WebRTC/DTLS 1.2 session with valid STUN Binding/Allocate handshakes and continuous fixed-interval media datagrams sent to known video conference relays. Inner WireGuard packets and destination endpoints are secured via double encryption.
-- **Intermediate TURN Relay (e.g., VK / OK CDN or private Coturn):** Observes encrypted DTLS ApplicationData or RTP datagrams relayed between two authenticated endpoints. Inner packet contents, virtual IP addresses, and WireGuard session keys remain inaccessible to the relay.
+- **Network Observer (Provider DPI):** Observes a standard WebRTC/DTLS 1.2 session with valid STUN Binding/Allocate handshakes and a continuous stream of fixed-format media datagrams sent to known video conference relays. Inner WireGuard packets and destination endpoints are secured via double encryption.
+- **Intermediate TURN Relay (e.g., VK / OK CDN or private Coturn):** Observes an encrypted TURN ChannelData stream relayed between two authenticated endpoints. Inner packet contents, virtual IP addresses, and WireGuard session keys remain inaccessible to the relay.
 - **Your Private Server:** Decapsulates datagrams, verifies cryptographic Pre-Auth Knock tokens, extracts inner WireGuard datagrams, and forwards them into the host Linux network stack.
 
 ---
@@ -45,27 +45,42 @@ flowchart LR
 
 ## 3. Project Structure and Status
 
-The project is currently under active development (Stage 4). All components are engineered from scratch in Rust (2024 edition) under GPL-3.0:
+The project is currently under active development. All components are engineered from scratch in Rust (2024 edition) under GPL-3.0. The Linux client and server are functionally complete (transport, routing, DNS, host management); the graphical interface and the Android client remain at the scaffold stage.
 
 | Component | Location | Description | Implementation Status |
 | :--- | :--- | :--- | :--- |
-| **`wdtt-core`** | [`crates/core`](crates/core) | Core transport engine, adaptive resequencer, Knock pre-authentication | **Implemented** (ready for I/O batching) |
+| **`wdtt-core`** | [`crates/core`](crates/core) | Core transport engine, stream pool, resequencer, keepalive, reconnect, TUN datapath | **Implemented** |
 | **`wdtt-proto`** | [`crates/proto`](crates/proto) | WDTT v2 framing serialization, URL parsing for `wdtt://` and `qwdtt://` | **Implemented** (fuzz-tested) |
-| **`wdtt-crypto`** | [`crates/crypto`](crates/crypto) | Pre-Auth Knock (ChaCha20-Poly1305), TTL Anti-Replay cache, KDF | **Implemented** (15 unit tests, proptest) |
-| **`wdtt-turn`** | [`crates/turn`](crates/turn) | STUN/TURN client, ChannelData framing (RFC 8656), mock server | **Implemented** (live coturn test suite) |
-| **`wdtt-server`** | [`crates/server`](crates/server) | Standalone server daemon for Linux (x86_64, aarch64 musl static) | **Implemented** (benchmarked at >1.8 Gbps) |
-| **`wdttd`** | [`crates/daemon`](crates/daemon) | Client daemon for Linux, Windows, macOS | **Implemented** (verified with kernel WireGuard) |
-| **`wdtt-ipc`** | [`crates/ipc`](crates/ipc) | IPC protocol between daemon and UI (Zero-Copy Postcard) | **Implemented** (base IPC schemas) |
-| **`wdtt-gui`** | [`crates/gui-desktop`](crates/gui-desktop) | Lightweight native desktop GUI using Slint | **In Development** (scheduled for Stage 4) |
-| **`wdtt-android`** | [`crates/ffi-android`](crates/ffi-android) | Kotlin Jetpack Compose UI + Rust Core (UniFFI / VpnService) | **In Development** (FFI builds in CI, UI in Stage 4) |
+| **`wdtt-crypto`** | [`crates/crypto`](crates/crypto) | Pre-Auth Knock (ChaCha20-Poly1305), TTL Anti-Replay cache, KDF | **Implemented** |
+| **`wdtt-turn`** | [`crates/turn`](crates/turn) | STUN/TURN client, ChannelData framing (RFC 8656), stream pool, mock server | **Implemented** (live coturn test suite) |
+| **`wdtt-tun`** | [`crates/tun`](crates/tun) | Host management: policy routing, nftables, kill-switch, DNS forwarder, geo data, xray-compatible routing | **Implemented** (Linux) |
+| **`wdtt-provider`** | [`crates/provider`](crates/provider) | TURN credential provider factory with on-disk cache | **Implemented** |
+| **`wdtt-server`** | [`crates/server`](crates/server) | Standalone server daemon for Linux (x86_64, aarch64 musl static) | **Implemented** (>1.8 Gbps on the testbed) |
+| **`wdttd`** | [`crates/daemon`](crates/daemon) | Client daemon for Linux | **Implemented** (verified with kernel WireGuard) |
+| **`wdtt-ipc`** | [`crates/ipc`](crates/ipc) | IPC protocol between daemon and UI | **Implemented** (base schemas) |
+| **`wdtt-gui`** | [`crates/gui-desktop`](crates/gui-desktop) | Native desktop GUI using Slint | **In Development** (scaffold) |
+| **`wdtt-android`** | [`crates/ffi-android`](crates/ffi-android) | Kotlin Jetpack Compose UI + Rust Core (UniFFI / VpnService) | **In Development** (FFI builds in CI) |
+
+### 3.1 Implemented Client Mechanisms
+
+- **Parallel TURN stream pool.** Several TURN streams are established at once, each served by its own task, so congestion on one stream does not stall the others.
+- **Transport reconnect.** Losing a stream does not terminate the process: the client re-establishes the pool and keeps running.
+- **TURN credential refresh.** Relay credentials are refreshed before they expire; on an authorization failure the pool is re-established with a single retry.
+- **Connect timeout.** Stream establishment is bounded from above, so an unreachable relay cannot hang startup.
+- **Policy routing.** Packets selected by the rules are marked in nftables and sent into a separate routing table through the TUN interface; all other traffic follows the normal path.
+- **Kill-switch.** Packets marked for the tunnel that leave the host through another interface are dropped. It is implemented as its own nftables table and does not touch other applications' rules.
+- **`outboundTag: "block"` rules.** Compiled into real drop rules in a separate nftables table, independent of the marking table.
+- **DNS forwarder.** A local resolver that restores the system settings on shutdown.
+- **Geo data and xray-compatible routing.** Parsing of `geoip:`/`geosite:` categories and of a rule configuration compatible with xray.
+- **Ordered setup with rollback.** Host configuration runs step by step and rolls back if any step fails.
 
 ---
 
 ## 4. Performance Benchmarks and Measurements
 
-All benchmarks below reflect reproducible hardware measurements ([docs/BENCHMARKS.md](docs/BENCHMARKS.md)) performed in isolated Linux network namespaces (`x86_64, 16 vCPU, Linux`, kernel 6.18, MTU 1200):
+All benchmarks below reflect reproducible hardware measurements ([docs/BENCHMARKS.md](docs/BENCHMARKS.md)) performed in isolated Linux network namespaces (`x86_64, 16 vCPU, Linux`, kernel 6.18, MTU 1200). They characterise the transport core at the time of measurement and are given as a historical reference point, not as a performance guarantee on arbitrary hardware:
 
-| Metric | Legacy Implementations (Architectural Code Audit) | `wdtt-rs` (Stage 3.5 Clean Testbed) | Engineering Reason |
+| Metric | Legacy Implementations (Architectural Code Audit) | `wdtt-rs` (Measured Testbed) | Engineering Reason |
 | :--- | :--- | :--- | :--- |
 | **Packet Loss under 35 ms Jitter** | Connection drop / TCP DupACK flood | **0.00% loss** (10/10 ICMP, WG Handshake OK) | Adaptive resequencer (`gap_timeout = 1.25*skew + 5ms`) |
 | **Single-Stream TCP Throughput** | Throttled by Go runtime channel locks | **1846.02–1920.16 Mbits/s** | Zero-copy datapath and tuned socket buffers |
@@ -85,12 +100,12 @@ All benchmarks below reflect reproducible hardware measurements ([docs/BENCHMARK
 
 ### Prerequisites
 - Rust toolchain: `rustc >= 1.85` (stable channel recommended: `rustup default stable`).
-- For local end-to-end testbed: `coturn`, `wireguard-tools`, `iperf3`, `iproute2`.
+- For local end-to-end testbed: `coturn`, `wireguard-tools`, `iperf3`, `iproute2`, `nftables`.
 
 ### 5.1 Compiling
 ```bash
 git clone https://github.com/KeylHenrih/WDTT-fork.git
-cd wdtt-rs
+cd WDTT-fork
 
 # Compile all workspace crates in release mode
 cargo build --release
@@ -99,6 +114,9 @@ cargo build --release
 cargo test --workspace
 ```
 
+> [!NOTE]
+> Repository URL references in the tree use the `<REPO_URL>` placeholder. Run `scripts/set_repo_url.sh <URL>` with the real address before building a release.
+
 ### 5.2 Running the Automated Local Testbed
 A complete end-to-end benchmark script executing within network namespaces is included:
 ```bash
@@ -106,8 +124,8 @@ A complete end-to-end benchmark script executing within network namespaces is in
 python3 scripts/benchmark_tunnel.py --duration 10
 ```
 
-### 5.3 Server Deployment Guide
-The script `scripts/deploy_test_server.sh` prints an isolated deployment plan for system administrators (firewall append rules, unprivileged systemd services, rollback commands):
+### 5.3 Server Deployment Scripts
+The `scripts/` directory collects helper scripts for installing and removing the server side (`install_vk_server.sh`, `uninstall_vk_server.sh`, `deploy_test_server.sh`, and others). The deployment script prints a step-by-step plan for administrators (targeted firewall rules, running coturn and the server as an unprivileged user, rollback commands):
 ```bash
 # Print dry-run server deployment plan (modifies nothing on host):
 ./scripts/deploy_test_server.sh
@@ -120,6 +138,9 @@ The script `scripts/deploy_test_server.sh` prints an isolated deployment plan fo
 1. **Traffic Analysis:** Network observers can measure packet sizes, transmission timings, and the public IP address of the intermediate TURN relay. Resistance against advanced side-channel statistical correlation is not guaranteed in current versions.
 2. **Third-Party Relay Dependency:** If an external relay infrastructure revokes access tokens, flags accounts, or applies strict bandwidth throttling (`STUN 486`), tunnel performance will be bound to relay constraints.
 3. **Endpoint Cryptographic Integrity:** Security relies on the integrity of private WireGuard keys and the Pre-Auth Knock secret. Compromise of either key permits unauthorized traffic decryption or injection.
+4. **Undocumented TURN Acquisition Procedure:** The part of the protocol that obtains TURN credentials from a third-party platform (request order, token format, binding to the call session) is a **reconstruction from observed client behaviour**, not an official specification. This procedure is undocumented by the vendor, may change or be disabled at any time without notice, and if that happens the corresponding provider stops working until the code is updated. The modular architecture (`crates/provider`) allows replacing or supplementing this provider with another source of TURN access.
+5. **Platform Account Risk:** Using a third-party platform account to relay non-target traffic may lead to restriction, blocking, or deletion of that account. Use a separate account not tied to personal data, and do not rely on its continued availability.
+6. **User Responsibility:** The project provides a transport mechanism and does not operate the relay infrastructure. Choosing a relay, complying with its terms of use, and assessing legal risk remain the user's responsibility.
 
 ---
 
