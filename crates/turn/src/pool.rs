@@ -39,6 +39,15 @@ pub const DEFAULT_MAX_STREAMS: usize = 8;
 /// How long a liveness probe may take before the stream is considered dead.
 pub const DEFAULT_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long establishing one stream may take before the attempt is abandoned.
+///
+/// A TURN server that accepts the TCP connection but never finishes the TLS
+/// handshake (or never answers the allocation) would otherwise stall `fill`
+/// for as long as the peer keeps the socket open; the observed failure mode was
+/// a five-minute freeze with a healthy first stream sitting idle the whole
+/// time.
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// A single pooled stream: the client plus the relay address it was granted.
 pub(crate) struct PooledStream {
     client: StreamTurnClient,
@@ -55,6 +64,7 @@ pub struct StreamPool {
     target_size: usize,
     max_size: usize,
     probe_timeout: Duration,
+    connect_timeout: Duration,
     streams: Vec<PooledStream>,
     /// Relay address of the stream handed out by the last `acquire`, if any.
     in_use: Option<SocketAddr>,
@@ -76,6 +86,7 @@ impl StreamPool {
             target_size,
             max_size,
             probe_timeout: DEFAULT_PROBE_TIMEOUT,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             streams: Vec::with_capacity(max_size),
             in_use: None,
             retired: 0,
@@ -86,6 +97,13 @@ impl StreamPool {
     #[must_use]
     pub fn with_probe_timeout(mut self, probe_timeout: Duration) -> Self {
         self.probe_timeout = probe_timeout;
+        self
+    }
+
+    /// Override how long establishing one stream may take.
+    #[must_use]
+    pub fn with_connect_timeout(mut self, connect_timeout: Duration) -> Self {
+        self.connect_timeout = connect_timeout;
         self
     }
 
@@ -132,9 +150,23 @@ impl StreamPool {
             )));
         }
 
-        let mut client = StreamTurnClient::connect(self.config.clone()).await?;
-        let relayed_addr = client.allocate_relay().await?;
-        client.bind_peer(self.config.peer_addr).await?;
+        // Bound the whole establish sequence: a peer that accepts the socket
+        // but stalls the handshake must not hold up the pool.
+        let established = timeout(self.connect_timeout, async {
+            let mut client = StreamTurnClient::connect(self.config.clone()).await?;
+            let relayed_addr = client.allocate_relay().await?;
+            client.bind_peer(self.config.peer_addr).await?;
+            Ok::<_, TurnError>((client, relayed_addr))
+        })
+        .await
+        .map_err(|_| {
+            TurnError::Transport(format!(
+                "stream establish timed out after {:?}",
+                self.connect_timeout
+            ))
+        })??;
+
+        let (client, relayed_addr) = established;
 
         debug!(
             "Stream pool: established stream {} of {} (relay {relayed_addr})",
@@ -415,6 +447,13 @@ mod tests {
         let pool = StreamPool::new(StreamClientConfig::default(), 2, 8)
             .with_probe_timeout(Duration::from_millis(250));
         assert_eq!(pool.probe_timeout, Duration::from_millis(250));
+    }
+
+    #[test]
+    fn connect_timeout_is_configurable() {
+        let pool = StreamPool::new(StreamClientConfig::default(), 2, 8)
+            .with_connect_timeout(Duration::from_millis(120));
+        assert_eq!(pool.connect_timeout, Duration::from_millis(120));
     }
 
     #[test]
