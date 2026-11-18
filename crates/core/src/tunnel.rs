@@ -109,6 +109,25 @@ pub enum TunnelError {
     Wg(#[from] wdtt_tun::WgError),
 }
 
+impl TunnelError {
+    /// Whether this error looks like a TURN authentication failure.
+    ///
+    /// Used to decide if re-acquiring credentials is worth trying: a 401/403
+    /// (or 438 stale nonce) from the relay, or a rejected allocation, means the
+    /// short-lived credentials have most likely lapsed. Transport and timeout
+    /// errors are *not* treated as authentication failures.
+    pub fn is_auth_failure(&self) -> bool {
+        match self {
+            TunnelError::Turn(TurnError::StunErrorResponse { code, .. }) => {
+                matches!(code, 401 | 403 | 438)
+            }
+            TunnelError::Turn(TurnError::AllocationFailed) => true,
+            TunnelError::Unauthorized(_) => true,
+            _ => false,
+        }
+    }
+}
+
 /// Keepalive and NAT maintenance mode for client tunnel session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum KeepaliveMode {
@@ -119,6 +138,60 @@ pub enum KeepaliveMode {
     Chaff,
     /// Keepalive disabled (manual testing).
     Disabled,
+}
+
+/// Freshly acquired TURN credentials returned by a [`CredentialRefresher`].
+///
+/// This is a deliberately narrow mirror of the provider crate's credential
+/// type: `crates/core` must not depend on `crates/provider`, so the daemon
+/// adapts whatever provider it holds into this shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefreshedCredentials {
+    /// TURN username.
+    pub username: String,
+    /// TURN password / credential token.
+    pub password: String,
+    /// TURN realm.
+    pub realm: String,
+    /// Resolved relay server address to connect to.
+    pub server_addr: SocketAddr,
+    /// Optional SNI hostname to use for TLS.
+    pub sni: Option<String>,
+    /// Expiration timestamp in seconds since the UNIX epoch (0 = indefinite).
+    pub expires_at: u64,
+}
+
+/// Boxed future returned by a [`CredentialRefresher`].
+pub type CredentialFuture = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<RefreshedCredentials, String>> + Send>,
+>;
+
+/// Async callback that re-acquires TURN credentials when they lapse.
+///
+/// The client consults this before building a stream pool once the current
+/// credentials are near expiry, and once more if stream establishment fails
+/// with what looks like an authentication error. Providers that mint
+/// short-lived TURN credentials (VK Calls) need this so a long-running tunnel
+/// recovers instead of dying when the credential TTL lapses.
+#[derive(Clone)]
+pub struct CredentialRefresher(Arc<dyn Fn() -> CredentialFuture + Send + Sync>);
+
+impl CredentialRefresher {
+    /// Wraps a boxed refresh callback.
+    pub fn new(f: Arc<dyn Fn() -> CredentialFuture + Send + Sync>) -> Self {
+        Self(f)
+    }
+
+    /// Runs the refresh callback and awaits the credentials it produces.
+    pub async fn run(&self) -> Result<RefreshedCredentials, String> {
+        (self.0)().await
+    }
+}
+
+impl std::fmt::Debug for CredentialRefresher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CredentialRefresher")
+    }
 }
 
 /// Configuration parameters for establishing a client tunnel session.
@@ -163,6 +236,15 @@ pub struct TunnelClientConfig {
     pub wg_preshared_key: Option<String>,
     /// WireGuard persistent keepalive in seconds.
     pub wg_keepalive: Option<u16>,
+    /// Optional async callback that re-acquires TURN credentials.
+    ///
+    /// When set, the client calls it before rebuilding the stream pool if the
+    /// current credentials are near expiry, and again if establishment fails
+    /// with an authentication error. `None` disables credential refresh.
+    pub credential_refresher: Option<CredentialRefresher>,
+    /// Expiration timestamp (UNIX seconds) of [`Self::turn_username`] and
+    /// [`Self::turn_password`]; `0` means the credentials never expire.
+    pub credentials_expire_at: u64,
 }
 
 /// Configuration parameters for establishing a server tunnel session.
@@ -286,6 +368,82 @@ impl TunnelClient {
     /// Access metrics collector for this tunnel session.
     pub fn metrics(&self) -> Arc<TunnelMetrics> {
         self.metrics.clone()
+    }
+
+    /// Builds a [`StreamClientConfig`] from the live client configuration.
+    ///
+    /// Extracted so the four pool-establishment sites (two initial starts and
+    /// two reconnect paths) cannot drift apart, and so credential refresh has a
+    /// single place to publish updated values into.
+    fn build_stream_config(&self) -> StreamClientConfig {
+        StreamClientConfig {
+            server_addr: self.config.turn_server_addr,
+            peer_addr: self.config.server_relayed_addr,
+            username: self.config.turn_username.clone(),
+            password: self.config.turn_password.clone(),
+            channel_number: 0x4000,
+            lifetime_sec: 600,
+            transport: self.config.turn_transport,
+            sni: self.config.turn_sni.clone(),
+            custom_ca_der: self.config.custom_ca_der.clone(),
+            bind_interface: self.config.bind_interface.clone(),
+            tx_queue_capacity: 1024,
+        }
+    }
+
+    /// How long before expiry credentials are considered stale.
+    const CREDENTIAL_REFRESH_MARGIN: Duration = Duration::from_secs(300);
+
+    /// Re-acquires TURN credentials when they are near expiry.
+    ///
+    /// Returns `true` when fresh credentials were installed into
+    /// [`TunnelClientConfig`]. Does nothing (returning `Ok(false)`) when no
+    /// refresher is configured or the credentials are still fresh.
+    async fn refresh_credentials_if_stale(&mut self) -> Result<bool, TunnelError> {
+        let Some(refresher) = self.config.credential_refresher.clone() else {
+            return Ok(false);
+        };
+        let expires_at = self.config.credentials_expire_at;
+        if expires_at == 0 {
+            return Ok(false);
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if now + Self::CREDENTIAL_REFRESH_MARGIN.as_secs() < expires_at {
+            return Ok(false);
+        }
+        info!("TURN credentials near expiry; re-acquiring from provider");
+        self.apply_refreshed_credentials(refresher.run().await)?;
+        Ok(true)
+    }
+
+    /// Forces a credential refresh regardless of the current expiry time.
+    async fn refresh_credentials_now(&mut self) -> Result<bool, TunnelError> {
+        let Some(refresher) = self.config.credential_refresher.clone() else {
+            return Ok(false);
+        };
+        info!("Stream establishment failed with an auth error; re-acquiring TURN credentials");
+        self.apply_refreshed_credentials(refresher.run().await)?;
+        Ok(true)
+    }
+
+    /// Installs freshly acquired credentials into the live configuration.
+    fn apply_refreshed_credentials(
+        &mut self,
+        result: Result<RefreshedCredentials, String>,
+    ) -> Result<(), TunnelError> {
+        let creds = result.map_err(TunnelError::Unauthorized)?;
+        self.config.turn_username = creds.username;
+        self.config.turn_password = creds.password;
+        self.config.turn_realm = creds.realm;
+        self.config.turn_server_addr = creds.server_addr;
+        if let Some(sni) = creds.sni {
+            self.config.turn_sni = Some(sni);
+        }
+        self.config.credentials_expire_at = creds.expires_at;
+        Ok(())
     }
 
     /// Run the client datapath with optional notification sender for when relay allocation completes.
@@ -835,21 +993,7 @@ impl TunnelClient {
         let wg_socket = Arc::new(bind_tuned_udp_socket(self.config.wg_listen_addr)?);
         info!("WireGuard bridge listening on {}", wg_socket.local_addr()?);
 
-        let stream_cfg = StreamClientConfig {
-            server_addr: self.config.turn_server_addr,
-            peer_addr: self.config.server_relayed_addr,
-            username: self.config.turn_username.clone(),
-            password: self.config.turn_password.clone(),
-            channel_number: 0x4000,
-            lifetime_sec: 600,
-            transport: self.config.turn_transport,
-            sni: self.config.turn_sni.clone(),
-            custom_ca_der: self.config.custom_ca_der.clone(),
-            bind_interface: self.config.bind_interface.clone(),
-            tx_queue_capacity: 1024,
-        };
-
-        let mut pool = self.establish_stream_pool(&stream_cfg).await?;
+        let mut pool = self.establish_stream_pool().await?;
         let mut guard = pool.acquire().await?;
         let my_relayed = guard
             .relayed_addr()
@@ -1134,7 +1278,7 @@ impl TunnelClient {
                     // refill before we try to reconnect.
                     guard.release(&mut pool, false).await;
 
-                    match self.establish_stream_pool(&stream_cfg).await {
+                    match self.establish_stream_pool().await {
                         Ok(new_pool) => {
                             pool = new_pool;
                             match pool.acquire().await {
@@ -1216,21 +1360,7 @@ impl TunnelClient {
             tun_name, self.config.turn_server_addr
         );
 
-        let stream_cfg = StreamClientConfig {
-            server_addr: self.config.turn_server_addr,
-            peer_addr: self.config.server_relayed_addr,
-            username: self.config.turn_username.clone(),
-            password: self.config.turn_password.clone(),
-            channel_number: 0x4000,
-            lifetime_sec: 600,
-            transport: self.config.turn_transport,
-            sni: self.config.turn_sni.clone(),
-            custom_ca_der: self.config.custom_ca_der.clone(),
-            bind_interface: self.config.bind_interface.clone(),
-            tx_queue_capacity: 1024,
-        };
-
-        let mut pool = self.establish_stream_pool(&stream_cfg).await?;
+        let mut pool = self.establish_stream_pool().await?;
         let mut guard = pool.acquire().await?;
         let my_relayed = guard
             .relayed_addr()
@@ -1434,7 +1564,7 @@ impl TunnelClient {
                     // refill before we try to reconnect.
                     guard.release(&mut pool, false).await;
 
-                    match self.establish_stream_pool(&stream_cfg).await {
+                    match self.establish_stream_pool().await {
                         Ok(new_pool) => {
                             pool = new_pool;
                             match pool.acquire().await {
@@ -1487,25 +1617,23 @@ impl TunnelClient {
     /// again after a transport failure without duplicating the handshake. The
     /// pool keeps several allocations alive so a single dead stream does not
     /// take the tunnel down with it.
-    async fn establish_stream_pool(
-        &self,
-        stream_cfg: &StreamClientConfig,
-    ) -> Result<StreamPool, TunnelError> {
-        let mut pool = StreamPool::new(
-            stream_cfg.clone(),
-            crate::MIN_STREAMS,
-            crate::MAX_STREAMS_PER_HASH,
-        );
-        if pool.fill().await == 0 {
-            return Err(TunnelError::Turn(wdtt_turn::TurnError::Transport(
-                "stream pool could not establish any stream".into(),
-            )));
-        }
-        info!(
-            "Client established {} of {} stream allocations",
-            pool.len(),
-            pool.target_size()
-        );
+    async fn establish_stream_pool(&mut self) -> Result<StreamPool, TunnelError> {
+        // If the credentials are at or near expiry, replace them before
+        // spending a connection attempt on a relay that will reject us.
+        self.refresh_credentials_if_stale().await?;
+        let stream_cfg = self.build_stream_config();
+
+        let pool = match self.try_establish_stream_pool(&stream_cfg).await {
+            Ok(pool) => pool,
+            Err(err) if err.is_auth_failure() && self.config.credential_refresher.is_some() => {
+                // The relay turned us down; the credentials have almost
+                // certainly lapsed. Force a refresh and try exactly once more.
+                self.refresh_credentials_now().await?;
+                let retry_cfg = self.build_stream_config();
+                self.try_establish_stream_pool(&retry_cfg).await?
+            }
+            Err(err) => return Err(err),
+        };
 
         // Send the pre-auth knock on every stream so any of them can carry the
         // session once it is checked out.
@@ -1532,6 +1660,7 @@ impl TunnelClient {
             &mut knock_frame,
         );
 
+        let mut pool = pool;
         for _ in 0..pool.len() {
             let mut guard = pool.acquire().await?;
             guard.send_channel_data(&knock_frame).await?;
@@ -1539,6 +1668,29 @@ impl TunnelClient {
         }
         info!("Pre-Auth knock sent to server over {} streams", pool.len());
 
+        Ok(pool)
+    }
+
+    /// Establishes and fills a stream pool without touching credentials.
+    async fn try_establish_stream_pool(
+        &self,
+        stream_cfg: &StreamClientConfig,
+    ) -> Result<StreamPool, TunnelError> {
+        let mut pool = StreamPool::new(
+            stream_cfg.clone(),
+            crate::MIN_STREAMS,
+            crate::MAX_STREAMS_PER_HASH,
+        );
+        if pool.fill().await == 0 {
+            return Err(TunnelError::Turn(wdtt_turn::TurnError::Transport(
+                "stream pool could not establish any stream".into(),
+            )));
+        }
+        info!(
+            "Client established {} of {} stream allocations",
+            pool.len(),
+            pool.target_size()
+        );
         Ok(pool)
     }
 

@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 use tokio::sync::watch;
 use tracing::{error, info, warn};
+use wdtt_core::tunnel::RefreshedCredentials;
 use wdtt_core::{KeepaliveMode, TunnelClient, TunnelClientConfig, TurnTransportMode};
 use wdtt_provider::{CaptchaMode, ProviderConfig, ProviderKind, TurnCredentials, build_provider};
 #[cfg(target_os = "linux")]
@@ -559,6 +560,11 @@ async fn async_main(mut args: ClientArgs) -> Result<(), Box<dyn std::error::Erro
         None => None,
     };
 
+    // Kept alive past the credential block so a refresher closure can be
+    // handed to the tunnel client for runtime re-acquisition.
+    let mut live_provider: Option<std::sync::Arc<dyn wdtt_provider::TurnProvider>> = None;
+    let mut credentials_expire_at: u64 = 0;
+
     if let Some(kind) = kind {
         let config = ProviderConfig {
             kind: Some(kind),
@@ -586,12 +592,16 @@ async fn async_main(mut args: ClientArgs) -> Result<(), Box<dyn std::error::Erro
             }),
         };
 
-        let provider = build_provider(&config)?;
+        let provider: std::sync::Arc<dyn wdtt_provider::TurnProvider> =
+            std::sync::Arc::from(build_provider(&config)?);
         info!(
             "Acquiring TURN credentials via the {} provider...",
             kind.name()
         );
         let creds = provider.acquire_credentials().await?;
+
+        credentials_expire_at = creds.expires_at;
+        live_provider = Some(provider);
 
         args.turn_username = creds.username;
         args.turn_password = creds.password;
@@ -675,6 +685,25 @@ async fn async_main(mut args: ClientArgs) -> Result<(), Box<dyn std::error::Erro
         no_dns: args.no_dns,
     };
 
+    let credential_refresher: Option<wdtt_core::tunnel::CredentialRefresher> =
+        live_provider.map(|provider| {
+            let bind_iface = args.bind_iface.clone();
+            let transport = args.turn_transport;
+            let sni_override = args.turn_sni.clone();
+            wdtt_core::tunnel::CredentialRefresher::new(std::sync::Arc::new(move || {
+                let provider = provider.clone();
+                let bind_iface = bind_iface.clone();
+                let sni_override = sni_override.clone();
+                Box::pin(async move {
+                    let creds = provider
+                        .acquire_credentials()
+                        .await
+                        .map_err(|e| format!("credential refresh failed: {e}"))?;
+                    resolve_refreshed_credentials(creds, transport, sni_override, bind_iface).await
+                })
+            }))
+        });
+
     let config = TunnelClientConfig {
         turn_server_addr: turn_server,
         turn_username: args.turn_username,
@@ -701,6 +730,8 @@ async fn async_main(mut args: ClientArgs) -> Result<(), Box<dyn std::error::Erro
         wg_peer_public_key: args.wg_peer_public_key,
         wg_preshared_key: args.wg_preshared_key,
         wg_keepalive: args.wg_keepalive,
+        credential_refresher,
+        credentials_expire_at,
     };
 
     let mut client = TunnelClient::new(config);
@@ -1001,4 +1032,49 @@ async fn check_vk_turn_udp(host: &str, bind_iface: Option<&str>) {
             );
         }
     }
+}
+
+/// Converts provider credentials into the tunnel's refresh shape, resolving
+/// the relay hostname and applying the same SNI and port rules used at startup.
+///
+/// A TURN credential refresh returns a hostname, not a socket address, and VK
+/// hands back the relay host as a name that must also become the TLS SNI. The
+/// port is remapped from the 3478 default to 443 when the stream transport
+/// requires TLS, mirroring the startup path so a refreshed tunnel connects the
+/// same way the original one did.
+async fn resolve_refreshed_credentials(
+    creds: TurnCredentials,
+    transport: TurnTransportMode,
+    sni_override: Option<String>,
+    _bind_iface: Option<String>,
+) -> Result<RefreshedCredentials, String> {
+    let host_is_ip = creds.host.parse::<std::net::IpAddr>().is_ok();
+    let sni = if host_is_ip {
+        sni_override
+    } else {
+        Some(creds.host.clone())
+    };
+
+    let port = if matches!(transport, TurnTransportMode::Tls | TurnTransportMode::Tcp)
+        && creds.port == 3478
+    {
+        443
+    } else {
+        creds.port
+    };
+
+    let server_addr = tokio::net::lookup_host(format!("{}:{}", creds.host, port))
+        .await
+        .map_err(|e| format!("Failed to resolve TURN host {}: {e}", creds.host))?
+        .next()
+        .ok_or_else(|| format!("No IP addresses found for TURN host {}", creds.host))?;
+
+    Ok(RefreshedCredentials {
+        username: creds.username,
+        password: creds.password,
+        realm: creds.realm,
+        server_addr,
+        sni,
+        expires_at: creds.expires_at,
+    })
 }

@@ -166,6 +166,8 @@ mod tests {
             wg_peer_public_key: None,
             wg_preshared_key: None,
             wg_keepalive: None,
+            credential_refresher: None,
+            credentials_expire_at: 0,
         };
         let mut client = TunnelClient::new(client_cfg);
         let client_metrics = client.metrics();
