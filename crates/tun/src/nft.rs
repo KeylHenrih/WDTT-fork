@@ -53,6 +53,24 @@ pub const SET_TUNNEL_PORTS: &str = "tunnel_ports";
 /// Name of the chain that marks packets for the policy route.
 pub const CHAIN_MARK: &str = "mark_out";
 
+/// Name of the nftables table holding blocked destinations.
+///
+/// Kept separate from [`NFT_TABLE`] so a drop decision can never be confused
+/// with a routing decision, and so tearing one down leaves the other intact.
+pub const NFT_BLOCK_TABLE: &str = "wdtt_block";
+
+/// Name of the address set holding blocked destinations.
+pub const SET_BLOCK_V4: &str = "block_v4";
+
+/// Name of the chain that drops blocked packets.
+pub const CHAIN_BLOCK: &str = "block_out";
+
+/// Priority of the block chain within the `output` hook.
+///
+/// Matches the mark chain's `mangle` priority so both run before the host's
+/// own firewall sees the packet.
+pub const BLOCK_PRIORITY: i32 = -150;
+
 /// Errors raised while compiling or applying a ruleset.
 #[derive(Debug, thiserror::Error)]
 pub enum NftError {
@@ -116,28 +134,44 @@ pub struct Approximation {
 pub struct CompiledRuleset {
     /// Mark rules, in evaluation order.
     pub rules: Vec<MarkRule>,
+    /// Rules that must be dropped rather than routed.
+    ///
+    /// These describe the same match dimensions as [`Self::rules`] but carry a
+    /// terminal `drop` instead of a mark, and are rendered into their own table
+    /// so a block rule can never be confused with a routing decision.
+    pub block_rules: Vec<MarkRule>,
     /// Rules whose projection is not exact.
     pub approximations: Vec<Approximation>,
 }
 
 impl CompiledRuleset {
     /// Returns true when no rule would mark any packet.
+    ///
+    /// This deliberately ignores [`Self::block_rules`]: callers use it to
+    /// decide whether the mark table has anything to install.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.rules.is_empty()
     }
+
+    /// Returns true when at least one rule asks for traffic to be dropped.
+    #[must_use]
+    pub fn has_block_rules(&self) -> bool {
+        !self.block_rules.is_empty()
+    }
 }
 
-/// Projects a routing table onto nftables mark rules.
+/// Projects a routing table onto nftables mark and drop rules.
 ///
-/// Only rules whose outbound is [`Outbound::Proxy`] are projected: the
-/// ruleset's sole job is to mark packets that must take the policy route.
-/// Rules selecting `direct` or `block` are handled by the routing engine and,
-/// for `block`, by the kill-switch.
+/// [`Outbound::Proxy`] rules are projected as mark rules: the ruleset's job is
+/// to mark packets that must take the policy route. [`Outbound::Block`] rules
+/// are projected as drop rules in a separate table, so they terminate the
+/// packet locally instead of routing it. Rules selecting `direct` or a named
+/// tag are left to the routing engine and produce no packet-layer statement.
 ///
 /// `resolved` supplies addresses obtained by resolving the domains referenced
 /// by a rule. A rule with domain criteria and no entry in `resolved` is
-/// skipped, because marking by domain is impossible at the packet layer.
+/// skipped, because matching by domain is impossible at the packet layer.
 #[must_use]
 pub fn compile_ruleset(
     table: &RoutingTable,
@@ -146,10 +180,11 @@ pub fn compile_ruleset(
     let mut out = CompiledRuleset::default();
 
     for rule in table.rules() {
-        if !rule.outbound.is_tunnelled() {
+        let matcher = &rule.matcher;
+        let outbound = rule.outbound.clone();
+        if matches!(outbound, Outbound::Direct | Outbound::Tagged(_)) {
             continue;
         }
-        let matcher = &rule.matcher;
 
         // Only IPv4 is projected: the generated set is `type ipv4_addr`, and a
         // `geoip:` category routinely carries IPv6 ranges alongside IPv4 ones.
@@ -233,14 +268,20 @@ pub fn compile_ruleset(
         };
 
         if mark_rule.is_catch_all() {
+            let detail = match outbound {
+                Outbound::Block => "rule matches every packet; it would block all traffic",
+                _ => "rule matches every packet; it would route all traffic through the tunnel",
+            };
             out.approximations.push(Approximation {
                 index: rule.index,
-                detail: "rule matches every packet; it would route all traffic through the tunnel"
-                    .to_owned(),
+                detail: detail.to_owned(),
             });
         }
 
-        out.rules.push(mark_rule);
+        match outbound {
+            Outbound::Block => out.block_rules.push(mark_rule),
+            _ => out.rules.push(mark_rule),
+        }
     }
 
     out
@@ -326,6 +367,57 @@ pub fn render_ruleset(ruleset: &CompiledRuleset) -> String {
     out
 }
 
+/// Renders the block rules into their own table.
+///
+/// The table has a single `output` chain that drops every packet matching a
+/// `block` rule and accepts everything else, so it never affects traffic the
+/// user did not explicitly ask to block. Blocked destinations are held in a
+/// dedicated address set, mirroring the mark table's layout.
+#[must_use]
+pub fn render_block_ruleset(ruleset: &CompiledRuleset) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "table inet {NFT_BLOCK_TABLE} {{");
+
+    // The block set is declared unconditionally so `block_v4` always exists
+    // when at least one rule references it, even if a rule is expanded inline.
+    let addresses: BTreeSet<String> = ruleset
+        .block_rules
+        .iter()
+        .flat_map(|r| r.dest_v4.iter().map(render_cidr))
+        .collect();
+    if !addresses.is_empty() {
+        let _ = writeln!(out, "\tset {SET_BLOCK_V4} {{");
+        let _ = writeln!(out, "\t\ttype ipv4_addr");
+        let _ = writeln!(out, "\t\tflags interval");
+        let _ = writeln!(out, "\t\telements = {{ {} }}", join(&addresses));
+        let _ = writeln!(out, "\t}}");
+    }
+
+    let _ = writeln!(out, "\tchain {CHAIN_BLOCK} {{");
+    let _ = writeln!(
+        out,
+        "\t\ttype filter hook output priority {BLOCK_PRIORITY}; policy accept;"
+    );
+
+    for rule in &ruleset.block_rules {
+        for line in render_block_rule(rule) {
+            let _ = writeln!(out, "\t\t{line}");
+        }
+    }
+
+    let _ = writeln!(out, "\t}}");
+    let _ = writeln!(out, "}}");
+    out
+}
+
+/// Renders one block rule as one or more `drop` statements.
+fn render_block_rule(rule: &MarkRule) -> Vec<String> {
+    if uses_address_set(rule) {
+        return vec![format!("ip daddr @{SET_BLOCK_V4} counter drop")];
+    }
+    render_rule_with(rule, "counter drop")
+}
+
 /// Returns true when a rule constrains addresses and nothing else, so it can
 /// reference the address set directly.
 fn uses_address_set(rule: &MarkRule) -> bool {
@@ -357,13 +449,21 @@ fn render_port_range(start: u16, end: u16) -> String {
 /// per combination, because nftables has no inline set syntax and referencing
 /// two sets in one statement would union rather than intersect them.
 fn render_mark_rule(rule: &MarkRule) -> Vec<String> {
-    let mark = format!("meta mark set {WDTT_FWMARK:#x}");
+    render_rule_with(rule, &format!("meta mark set {WDTT_FWMARK:#x}"))
+}
+
+/// Renders one rule, terminating each statement with `terminal`.
+///
+/// Shared by the mark rules (which set the routing mark) and the block rules
+/// (which drop), so both expand multi-dimension rules identically.
+fn render_rule_with(rule: &MarkRule, terminal: &str) -> Vec<String> {
+    let mark = terminal;
 
     if uses_address_set(rule) {
         return vec![format!("ip daddr @{SET_TUNNEL_V4} {mark}")];
     }
     if uses_port_set(rule) {
-        return render_port_statements(rule, &format!("th dport @{SET_TUNNEL_PORTS}"), &mark);
+        return render_port_statements(rule, &format!("th dport @{SET_TUNNEL_PORTS}"), mark);
     }
 
     let mut statements = Vec::new();
@@ -446,6 +546,37 @@ fn render_port_statements(rule: &MarkRule, port_clause: &str, mark: &str) -> Vec
 pub async fn apply_ruleset(ruleset: &CompiledRuleset) -> Result<(), NftError> {
     let script = render_ruleset(ruleset);
     run_nft(&script).await
+}
+
+/// Applies the block rules by piping them to `nft -f -`.
+///
+/// Any previous block table is removed first: a leftover table would make the
+/// create fail, and a stale one is worse than none.
+///
+/// # Errors
+///
+/// Returns [`NftError::Spawn`] when `nft` cannot be executed and
+/// [`NftError::Apply`] when it exits non-zero, with its stderr attached.
+pub async fn apply_block_ruleset(ruleset: &CompiledRuleset) -> Result<(), NftError> {
+    let _ = teardown_block().await;
+    let script = render_block_ruleset(ruleset);
+    run_nft(&script).await
+}
+
+/// Removes the block table, ignoring its absence.
+///
+/// # Errors
+///
+/// Returns [`NftError::Spawn`] when `nft` cannot be executed. A missing table
+/// is not an error.
+pub async fn teardown_block() -> Result<(), NftError> {
+    let script =
+        format!("table inet {NFT_BLOCK_TABLE} {{}}\ndelete table inet {NFT_BLOCK_TABLE}\n");
+    match run_nft(&script).await {
+        Ok(()) => Ok(()),
+        Err(NftError::Apply(message)) if message.contains("No such file") => Ok(()),
+        Err(other) => Err(other),
+    }
 }
 
 /// Removes the table owned by this program, ignoring its absence.
@@ -605,7 +736,7 @@ mod tests {
     }
 
     #[test]
-    fn skips_direct_and_block_rules() {
+    fn block_rules_become_drop_rules() {
         let table = table_from_json(
             r#"{"rules":[
                 {"ip":["1.1.1.1"],"outboundTag":"direct"},
@@ -614,8 +745,40 @@ mod tests {
             ]}"#,
         );
         let ruleset = compile_ruleset(&table, &std::collections::HashMap::new());
+        // Direct rules still vanish, but block is now projected separately.
         assert_eq!(ruleset.rules.len(), 1);
         assert_eq!(ruleset.rules[0].dest_v4.len(), 1);
+        assert!(ruleset.has_block_rules());
+        assert_eq!(ruleset.block_rules.len(), 1);
+        assert_eq!(ruleset.block_rules[0].dest_v4.len(), 1);
+    }
+
+    #[test]
+    fn block_rules_render_into_a_separate_drop_table() {
+        let table = table_from_json(r#"{"rules":[{"ip":["2.2.2.2"],"outboundTag":"block"}]}"#);
+        let ruleset = compile_ruleset(&table, &std::collections::HashMap::new());
+
+        let block = render_block_ruleset(&ruleset);
+        assert!(block.contains("table inet wdtt_block {"));
+        assert!(block.contains("set block_v4 {"));
+        assert!(block.contains("chain block_out {"));
+        assert!(block.contains("counter drop"));
+        assert!(!block.contains("iptables"));
+
+        // The mark ruleset must not carry the block table.
+        let mark = render_ruleset(&ruleset);
+        assert!(!mark.contains("wdtt_block"));
+        assert!(!mark.contains("counter drop"));
+    }
+
+    #[test]
+    fn block_rule_is_not_marked_as_tunnelled() {
+        let table = table_from_json(r#"{"rules":[{"ip":["2.2.2.2"],"outboundTag":"block"}]}"#);
+        let ruleset = compile_ruleset(&table, &std::collections::HashMap::new());
+        // A blocked rule never enters the mark set, so it cannot be tunnelled.
+        assert!(ruleset.is_empty());
+        assert!(ruleset.rules.is_empty());
+        assert_eq!(ruleset.block_rules[0].dest_v4.len(), 1);
     }
 
     #[test]

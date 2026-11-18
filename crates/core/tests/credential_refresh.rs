@@ -6,8 +6,8 @@
 //! client configuration and can be invoked.
 
 use std::net::SocketAddr;
-use wdtt_core::tunnel::{CredentialRefresher, CredentialFuture, RefreshedCredentials};
 use wdtt_core::TunnelError;
+use wdtt_core::tunnel::{CredentialFuture, CredentialRefresher, RefreshedCredentials};
 use wdtt_turn::TurnError;
 
 #[test]

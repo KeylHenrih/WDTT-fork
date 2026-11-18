@@ -128,6 +128,7 @@ struct Applied {
     tunnel_route: bool,
     policy_rule: bool,
     mark_table: bool,
+    block_table: bool,
     kill_switch: bool,
     resolver: Option<SystemResolver>,
 }
@@ -215,6 +216,13 @@ impl HostSetup {
             self.applied.mark_table = true;
         }
 
+        // 5b. Block rules. Kept in their own table so a drop decision is never
+        //     confused with a routing decision.
+        if self.config.ruleset.has_block_rules() {
+            nft::apply_block_ruleset(&self.config.ruleset).await?;
+            self.applied.block_table = true;
+        }
+
         // 6. DNS.
         if self.config.dns {
             let mut resolver = SystemResolver::detect(&iface, self.config.dns_listen.ip()).await;
@@ -249,6 +257,13 @@ impl HostSetup {
             && let Err(err) = resolver.restore().await
         {
             tracing::warn!("resolver restore failed: {err}");
+        }
+
+        if self.applied.block_table {
+            if let Err(err) = nft::teardown_block().await {
+                tracing::warn!("nftables block teardown failed: {err}");
+            }
+            self.applied.block_table = false;
         }
 
         if self.applied.mark_table {
@@ -312,6 +327,7 @@ impl HostSetup {
             || self.applied.tunnel_route
             || self.applied.policy_rule
             || self.applied.mark_table
+            || self.applied.block_table
             || self.applied.kill_switch
             || self.applied.resolver.is_some()
     }
