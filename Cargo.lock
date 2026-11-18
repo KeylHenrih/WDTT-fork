@@ -3484,6 +3484,7 @@ dependencies = [
  "tracing",
  "wdtt-crypto",
  "wdtt-proto",
+ "wdtt-tun",
  "wdtt-turn",
 ]
 

@@ -18,4 +18,5 @@ libc = { workspace = true }
 wdtt-proto = { workspace = true }
 wdtt-crypto = { workspace = true }
 wdtt-turn = { workspace = true }
+wdtt-tun = { workspace = true }
 siphasher = { workspace = true }

@@ -6,6 +6,7 @@
 pub mod batch;
 pub mod keepalive;
 pub mod metrics;
+pub mod tun_datapath;
 pub mod tunnel;
 
 pub use batch::{

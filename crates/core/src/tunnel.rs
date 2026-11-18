@@ -96,6 +96,14 @@ pub enum TunnelError {
     /// Unauthorized peer connection attempt.
     #[error("Unauthorized: {0}")]
     Unauthorized(String),
+
+    /// TUN device or WireGuard engine failure.
+    #[error("TUN error: {0}")]
+    Tun(#[from] wdtt_tun::TunError),
+
+    /// WireGuard engine failure.
+    #[error("WireGuard error: {0}")]
+    Wg(#[from] wdtt_tun::WgError),
 }
 
 /// Keepalive and NAT maintenance mode for client tunnel session.
