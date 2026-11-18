@@ -32,6 +32,7 @@ struct ClientArgs {
     earliest_time_secs: u64,
     bind_iface: Option<String>,
     captcha_mode: CaptchaMode,
+    ca_cert: Option<PathBuf>,
 }
 
 impl ClientArgs {
@@ -67,6 +68,7 @@ impl ClientArgs {
             .unwrap_or(DEFAULT_EARLIEST_VK_TIME);
         let mut bind_iface = None;
         let mut captcha_mode = CaptchaMode::Helper;
+        let mut ca_cert: Option<PathBuf> = None;
 
         let mut i = 1;
         while i < args.len() {
@@ -238,6 +240,10 @@ impl ClientArgs {
                     i += 1;
                     turn_sni = Some(args.get(i).ok_or("Missing value for --sni")?.clone());
                 }
+                "--ca" => {
+                    i += 1;
+                    ca_cert = Some(PathBuf::from(args.get(i).ok_or("Missing value for --ca")?));
+                }
                 "--runtime" => {
                     i += 1;
                     runtime = args.get(i).ok_or("Missing value for --runtime")?.clone();
@@ -272,6 +278,7 @@ impl ClientArgs {
                            --turn-realm <REALM>            TURN realm (default: coturn)\n  \
                            --transport <MODE>              TURN transport: udp (default), tcp, tls, auto\n  \
                            --sni <HOST>                    SNI hostname for TLS verification\n  \
+                           --ca <PATH>                     Custom CA certificate (DER) for TLS verification\n  \
                            --bind-iface <IFACE>            Bind outbound sockets to a network interface\n  \
                            --server-relayed <ADDR:PORT>    Remote server relayed address on TURN (required)\n  \
                            --wg-listen <ADDR:PORT>         Local WireGuard listening port (default: 127.0.0.1:51821)\n  \
@@ -319,6 +326,7 @@ impl ClientArgs {
             earliest_time_secs,
             bind_iface,
             captcha_mode,
+            ca_cert,
         })
     }
 }
@@ -442,7 +450,13 @@ async fn async_main(mut args: ClientArgs) -> Result<(), Box<dyn std::error::Erro
         coalesce_window: args.coalesce_window,
         turn_transport: args.turn_transport,
         turn_sni: args.turn_sni,
-        custom_ca_der: None,
+        custom_ca_der: match args.ca_cert {
+            Some(ref path) => Some(
+                std::fs::read(path)
+                    .map_err(|e| format!("Failed to read CA certificate {path:?}: {e}"))?,
+            ),
+            None => None,
+        },
         bind_interface: args.bind_iface,
     };
 
