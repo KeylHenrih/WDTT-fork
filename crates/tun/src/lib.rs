@@ -5,12 +5,14 @@
 
 #![deny(missing_docs)]
 
+pub mod geo;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
 pub mod netcfg;
 #[cfg(target_os = "linux")]
 pub mod netlink;
+pub mod routing;
 pub mod wg;
 
 #[cfg(target_os = "linux")]
@@ -19,6 +21,9 @@ pub use linux::TunDevice;
 pub use netcfg::{RouteSpec, WDTT_FWMARK, WDTT_ROUTE_TABLE, WDTT_RULE_PRIORITY};
 #[cfg(target_os = "linux")]
 pub use netlink::{NlRouteSpec, RuleSpec};
+pub use routing::{
+    ConnectionInfo, Outbound, Routing, RoutingError, RoutingTable, Rule, RuleMatcher,
+};
 pub use wg::{DATA_OVERHEAD_SZ, HANDSHAKE_INIT_SZ, HANDSHAKE_RESP_SZ, WgEngine, WgError, WgOutput};
 
 /// Virtual packet buffer type for TUN payload exchange.
