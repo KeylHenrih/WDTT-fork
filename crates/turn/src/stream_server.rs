@@ -87,7 +87,7 @@ impl StreamTurnServer {
         let listener = TcpListener::bind(config.listen_addr).await?;
         let acceptor = match (&config.tls_cert_der, &config.tls_key_der) {
             (Some(cert), Some(key)) => {
-                let certs = vec![CertificateDer::from(cert.clone())];
+                let certs = split_der_chain(cert);
                 let key = PrivateKeyDer::Pkcs8(key.clone().into());
                 let server_cfg = ServerConfig::builder()
                     .with_no_client_auth()
@@ -167,6 +167,50 @@ impl StreamTurnServer {
             control_rx: ctl_rx,
         })
     }
+}
+
+/// Split a concatenated DER certificate chain into individual certificates.
+///
+/// A PEM `fullchain.cer` converted with `openssl x509 -outform DER` yields only
+/// the leaf, but operators often `cat` several DER files together. rustls needs
+/// one `CertificateDer` per certificate, so walk the ASN.1 SEQUENCE lengths.
+fn split_der_chain(chain: &[u8]) -> Vec<CertificateDer<'static>> {
+    let mut certs = Vec::new();
+    let mut rest = chain;
+    while !rest.is_empty() {
+        let Some(len) = der_sequence_len(rest) else {
+            break;
+        };
+        if len > rest.len() {
+            break;
+        }
+        certs.push(CertificateDer::from(rest[..len].to_vec()));
+        rest = &rest[len..];
+    }
+    if certs.is_empty() {
+        certs.push(CertificateDer::from(chain.to_vec()));
+    }
+    certs
+}
+
+/// Total byte length of the DER SEQUENCE starting at `buf[0]`.
+fn der_sequence_len(buf: &[u8]) -> Option<usize> {
+    if buf.len() < 2 || buf[0] != 0x30 {
+        return None;
+    }
+    let first = buf[1];
+    if first < 0x80 {
+        return Some(2 + first as usize);
+    }
+    let n = (first & 0x7f) as usize;
+    if n == 0 || n > 3 || buf.len() < 2 + n {
+        return None;
+    }
+    let mut len = 0usize;
+    for &b in &buf[2..2 + n] {
+        len = (len << 8) | b as usize;
+    }
+    Some(2 + n + len)
 }
 
 trait AsyncStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
@@ -340,3 +384,36 @@ pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[allow(dead_code)]
 fn _assert_oneshot_used(_: oneshot::Sender<()>) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_der_chain_handles_single_cert() {
+        let leaf = include_bytes!("../tests/fixtures/server_cert.der");
+        let certs = split_der_chain(leaf);
+        assert_eq!(certs.len(), 1);
+        assert_eq!(certs[0].as_ref(), leaf.as_slice());
+    }
+
+    #[test]
+    fn split_der_chain_handles_concatenated_certs() {
+        let leaf = include_bytes!("../tests/fixtures/server_cert.der");
+        let ca = include_bytes!("../tests/fixtures/ca_cert.der");
+        let mut chain = Vec::new();
+        chain.extend_from_slice(leaf);
+        chain.extend_from_slice(ca);
+
+        let certs = split_der_chain(&chain);
+        assert_eq!(certs.len(), 2);
+        assert_eq!(certs[0].as_ref(), leaf.as_slice());
+        assert_eq!(certs[1].as_ref(), ca.as_slice());
+    }
+
+    #[test]
+    fn split_der_chain_falls_back_on_garbage() {
+        let certs = split_der_chain(b"not a certificate");
+        assert_eq!(certs.len(), 1);
+    }
+}
