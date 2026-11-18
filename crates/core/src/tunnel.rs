@@ -2,28 +2,38 @@
 
 #![forbid(unsafe_code)]
 
-use crate::batch::{BatchedUdpSocket, RecvMeta};
+use crate::batch::{BatchedUdpSocket, RecvMeta, TransmitPacket};
+use crate::keepalive::{AdaptiveKeepalive, AdaptiveKeepaliveConfig};
 use crate::metrics::TunnelMetrics;
-use bytes::BytesMut;
+use crate::resilience::{Backoff, Recovery, classify};
+use bytes::{Bytes, BytesMut};
 use rand::RngCore;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::UdpSocket;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tokio::time::interval;
 use tracing::{debug, error, info, trace, warn};
 use wdtt_crypto::{
     CryptoError, DEFAULT_MAX_CLOCK_SKEW_SEC, KnockAuthenticator, Psk, derive_pre_auth_knock_key,
 };
 use wdtt_proto::{
-    FrameType, FrameView, ProtoError, WgResequencer, encode_frame, inspect_wg_packet,
+    FrameType, FrameView, PingPayload, PongPayload, ProtoError, WgResequencer, encode_frame, flags,
+    inspect_wg_packet,
 };
-use wdtt_turn::{TurnClient, TurnClientConfig, TurnError, TurnIncoming};
+use wdtt_turn::{
+    StreamClientConfig, StreamConnectionHandle, StreamPool, StreamServerConfig, StreamTurnServer,
+    TurnClient, TurnClientConfig, TurnError, TurnIncoming, TurnTransportMode, encode_channel_data,
+    encode_tcp_channel_data,
+};
 
 const RESEQUENCER_TICK_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_PACKET_LEN: usize = 2048;
 const DEFAULT_SESSION_TTL: Duration = Duration::from_secs(300);
+/// How often the client probes idle pooled streams and prunes dead ones.
+const STREAM_POOL_PRUNE_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Helper to create and bind non-blocking UDP socket with 4 MB send/recv buffers.
 fn tune_socket_buffers(sock: &socket2::Socket) {
@@ -89,6 +99,99 @@ pub enum TunnelError {
     /// Unauthorized peer connection attempt.
     #[error("Unauthorized: {0}")]
     Unauthorized(String),
+
+    /// TUN device or WireGuard engine failure.
+    #[error("TUN error: {0}")]
+    Tun(#[from] wdtt_tun::TunError),
+
+    /// WireGuard engine failure.
+    #[error("WireGuard error: {0}")]
+    Wg(#[from] wdtt_tun::WgError),
+}
+
+impl TunnelError {
+    /// Whether this error looks like a TURN authentication failure.
+    ///
+    /// Used to decide if re-acquiring credentials is worth trying: a 401/403
+    /// (or 438 stale nonce) from the relay, or a rejected allocation, means the
+    /// short-lived credentials have most likely lapsed. Transport and timeout
+    /// errors are *not* treated as authentication failures.
+    pub fn is_auth_failure(&self) -> bool {
+        match self {
+            TunnelError::Turn(TurnError::StunErrorResponse { code, .. }) => {
+                matches!(code, 401 | 403 | 438)
+            }
+            TunnelError::Turn(TurnError::AllocationFailed) => true,
+            TunnelError::Unauthorized(_) => true,
+            _ => false,
+        }
+    }
+}
+
+/// Keepalive and NAT maintenance mode for client tunnel session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum KeepaliveMode {
+    /// Adaptive keepalive with Pong feedback (10s floor, starts at 20s, max 28s NAT ceiling).
+    #[default]
+    PowerSave,
+    /// Continuous low-rate chaff traffic mimicking Opus voice codec (50 pps @ 20ms).
+    Chaff,
+    /// Keepalive disabled (manual testing).
+    Disabled,
+}
+
+/// Freshly acquired TURN credentials returned by a [`CredentialRefresher`].
+///
+/// This is a deliberately narrow mirror of the provider crate's credential
+/// type: `crates/core` must not depend on `crates/provider`, so the daemon
+/// adapts whatever provider it holds into this shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefreshedCredentials {
+    /// TURN username.
+    pub username: String,
+    /// TURN password / credential token.
+    pub password: String,
+    /// TURN realm.
+    pub realm: String,
+    /// Resolved relay server address to connect to.
+    pub server_addr: SocketAddr,
+    /// Optional SNI hostname to use for TLS.
+    pub sni: Option<String>,
+    /// Expiration timestamp in seconds since the UNIX epoch (0 = indefinite).
+    pub expires_at: u64,
+}
+
+/// Boxed future returned by a [`CredentialRefresher`].
+pub type CredentialFuture = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<RefreshedCredentials, String>> + Send>,
+>;
+
+/// Async callback that re-acquires TURN credentials when they lapse.
+///
+/// The client consults this before building a stream pool once the current
+/// credentials are near expiry, and once more if stream establishment fails
+/// with what looks like an authentication error. Providers that mint
+/// short-lived TURN credentials (VK Calls) need this so a long-running tunnel
+/// recovers instead of dying when the credential TTL lapses.
+#[derive(Clone)]
+pub struct CredentialRefresher(Arc<dyn Fn() -> CredentialFuture + Send + Sync>);
+
+impl CredentialRefresher {
+    /// Wraps a boxed refresh callback.
+    pub fn new(f: Arc<dyn Fn() -> CredentialFuture + Send + Sync>) -> Self {
+        Self(f)
+    }
+
+    /// Runs the refresh callback and awaits the credentials it produces.
+    pub async fn run(&self) -> Result<RefreshedCredentials, String> {
+        (self.0)().await
+    }
+}
+
+impl std::fmt::Debug for CredentialRefresher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CredentialRefresher")
+    }
 }
 
 /// Configuration parameters for establishing a client tunnel session.
@@ -108,12 +211,46 @@ pub struct TunnelClientConfig {
     pub wg_listen_addr: SocketAddr,
     /// Pre-shared key for knock authentication and session establishment.
     pub psk: [u8; 32],
+    /// Keepalive mode for connection maintenance and DPI chaffing.
+    pub keepalive_mode: KeepaliveMode,
+    /// Optional transmit coalescing window (e.g. 1-2 ms) for grouping sparse packets.
+    pub coalesce_window: Option<Duration>,
+    /// Transport mode: Udp, Tcp, Tls, or Auto.
+    pub turn_transport: TurnTransportMode,
+    /// Optional SNI hostname for TLS verification.
+    pub turn_sni: Option<String>,
+    /// Optional custom CA certificate DER bytes for TLS testing.
+    pub custom_ca_der: Option<Vec<u8>>,
+    /// Optional network interface name for SO_BINDTODEVICE.
+    pub bind_interface: Option<String>,
+    /// Optional TUN interface name. When set, the client owns a real TUN
+    /// device and runs WireGuard in-process instead of bridging a UDP socket.
+    pub tun_name: Option<String>,
+    /// TUN interface MTU (default 1360).
+    pub tun_mtu: u16,
+    /// Local WireGuard private key (base64, as produced by `wg genkey`).
+    pub wg_private_key: Option<String>,
+    /// Peer WireGuard public key (base64).
+    pub wg_peer_public_key: Option<String>,
+    /// Optional WireGuard preshared key (base64).
+    pub wg_preshared_key: Option<String>,
+    /// WireGuard persistent keepalive in seconds.
+    pub wg_keepalive: Option<u16>,
+    /// Optional async callback that re-acquires TURN credentials.
+    ///
+    /// When set, the client calls it before rebuilding the stream pool if the
+    /// current credentials are near expiry, and again if establishment fails
+    /// with an authentication error. `None` disables credential refresh.
+    pub credential_refresher: Option<CredentialRefresher>,
+    /// Expiration timestamp (UNIX seconds) of [`Self::turn_username`] and
+    /// [`Self::turn_password`]; `0` means the credentials never expire.
+    pub credentials_expire_at: u64,
 }
 
 /// Configuration parameters for establishing a server tunnel session.
 #[derive(Debug, Clone)]
 pub struct TunnelServerConfig {
-    /// TURN relay server address.
+    /// TURN relay server address (used if direct_listen_addr is None).
     pub turn_server_addr: SocketAddr,
     /// TURN credentials username.
     pub turn_username: String,
@@ -125,6 +262,16 @@ pub struct TunnelServerConfig {
     pub wg_endpoint_addr: SocketAddr,
     /// Pre-shared key for knock authentication and session establishment.
     pub psk: [u8; 32],
+    /// Optional transmit coalescing window (e.g. 1-2 ms) for grouping sparse packets.
+    pub coalesce_window: Option<Duration>,
+    /// Optional direct UDP listen address (VK / direct mode).
+    pub direct_listen_addr: Option<SocketAddr>,
+    /// Optional TCP/TLS listen address for the stream TURN server.
+    pub stream_listen_addr: Option<SocketAddr>,
+    /// Optional TLS certificate chain (DER) for the stream listener.
+    pub tls_cert_der: Option<Vec<u8>>,
+    /// Optional TLS private key (PKCS#8 DER) for the stream listener.
+    pub tls_key_der: Option<Vec<u8>>,
 }
 
 /// Authorized client session state tracked by the server.
@@ -149,6 +296,60 @@ impl AuthorizedClientSession {
     }
 }
 
+/// Adaptive coalescing controller.
+///
+/// Evaluates arrival patterns per socket wakeup:
+/// - Sparse / uniform traffic (packets_per_wakeup < 2): coalescing window (1-2 ms) is active to batch frames.
+/// - Bursty traffic (packets_per_wakeup >= 2, e.g. TCP streams): coalescing is immediately disabled to minimize latency.
+/// - Control frames (Handshake, Ping, Pong, Keepalive) ALWAYS bypass the coalescing window.
+#[derive(Debug, Clone)]
+pub struct AdaptiveCoalescer {
+    window: Option<Duration>,
+    last_batch_size: usize,
+}
+
+impl AdaptiveCoalescer {
+    /// Create a new adaptive coalescer instance with optional window duration.
+    pub fn new(window: Option<Duration>) -> Self {
+        Self {
+            window,
+            last_batch_size: 1,
+        }
+    }
+
+    /// Record the number of packets read during the latest wakeup batch.
+    pub fn on_wakeup_batch(&mut self, batch_size: usize) {
+        self.last_batch_size = batch_size;
+    }
+
+    /// Returns true if coalescing should be applied for the current packet batch.
+    ///
+    /// Enabled only if a coalescing window is configured AND traffic is sparse/uniform (batch_size < 2).
+    /// Disabled immediately when traffic is bursty (batch_size >= 2).
+    pub fn is_coalescing_active(&self) -> bool {
+        self.window.is_some() && self.last_batch_size < 2
+    }
+
+    /// Get configured coalescing window duration.
+    pub fn window(&self) -> Option<Duration> {
+        self.window
+    }
+}
+
+/// Control or signaling frames that must immediately bypass the coalescing window.
+#[inline]
+pub fn is_control_frame(frame_type: FrameType) -> bool {
+    matches!(
+        frame_type,
+        FrameType::HandshakeInit
+            | FrameType::HandshakeResp
+            | FrameType::Ping
+            | FrameType::Pong
+            | FrameType::StreamFeedback
+            | FrameType::Disconnect
+    )
+}
+
 /// Client tunnel session terminating local WireGuard and relaying via TURN.
 pub struct TunnelClient {
     config: TunnelClientConfig,
@@ -169,14 +370,137 @@ impl TunnelClient {
         self.metrics.clone()
     }
 
+    /// Builds a [`StreamClientConfig`] from the live client configuration.
+    ///
+    /// Extracted so the four pool-establishment sites (two initial starts and
+    /// two reconnect paths) cannot drift apart, and so credential refresh has a
+    /// single place to publish updated values into.
+    fn build_stream_config(&self) -> StreamClientConfig {
+        StreamClientConfig {
+            server_addr: self.config.turn_server_addr,
+            peer_addr: self.config.server_relayed_addr,
+            username: self.config.turn_username.clone(),
+            password: self.config.turn_password.clone(),
+            channel_number: 0x4000,
+            lifetime_sec: 600,
+            transport: self.config.turn_transport,
+            sni: self.config.turn_sni.clone(),
+            custom_ca_der: self.config.custom_ca_der.clone(),
+            bind_interface: self.config.bind_interface.clone(),
+            tx_queue_capacity: 1024,
+        }
+    }
+
+    /// How long before expiry credentials are considered stale.
+    const CREDENTIAL_REFRESH_MARGIN: Duration = Duration::from_secs(300);
+
+    /// Re-acquires TURN credentials when they are near expiry.
+    ///
+    /// Returns `true` when fresh credentials were installed into
+    /// [`TunnelClientConfig`]. Does nothing (returning `Ok(false)`) when no
+    /// refresher is configured or the credentials are still fresh.
+    async fn refresh_credentials_if_stale(&mut self) -> Result<bool, TunnelError> {
+        let Some(refresher) = self.config.credential_refresher.clone() else {
+            return Ok(false);
+        };
+        let expires_at = self.config.credentials_expire_at;
+        if expires_at == 0 {
+            return Ok(false);
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if now + Self::CREDENTIAL_REFRESH_MARGIN.as_secs() < expires_at {
+            return Ok(false);
+        }
+        info!("TURN credentials near expiry; re-acquiring from provider");
+        self.apply_refreshed_credentials(refresher.run().await)?;
+        Ok(true)
+    }
+
+    /// Forces a credential refresh regardless of the current expiry time.
+    async fn refresh_credentials_now(&mut self) -> Result<bool, TunnelError> {
+        let Some(refresher) = self.config.credential_refresher.clone() else {
+            return Ok(false);
+        };
+        info!("Stream establishment failed with an auth error; re-acquiring TURN credentials");
+        self.apply_refreshed_credentials(refresher.run().await)?;
+        Ok(true)
+    }
+
+    /// Installs freshly acquired credentials into the live configuration.
+    fn apply_refreshed_credentials(
+        &mut self,
+        result: Result<RefreshedCredentials, String>,
+    ) -> Result<(), TunnelError> {
+        let creds = result.map_err(TunnelError::Unauthorized)?;
+        self.config.turn_username = creds.username;
+        self.config.turn_password = creds.password;
+        self.config.turn_realm = creds.realm;
+        self.config.turn_server_addr = creds.server_addr;
+        if let Some(sni) = creds.sni {
+            self.config.turn_sni = Some(sni);
+        }
+        self.config.credentials_expire_at = creds.expires_at;
+        Ok(())
+    }
+
     /// Run the client datapath with optional notification sender for when relay allocation completes.
     pub async fn run_with_notify(
+        &mut self,
+        cancel_rx: watch::Receiver<bool>,
+        on_allocated: Option<tokio::sync::oneshot::Sender<SocketAddr>>,
+    ) -> Result<(), TunnelError> {
+        if self.config.tun_name.is_some() {
+            return self.run_tun_with_notify(cancel_rx, on_allocated).await;
+        }
+        match self.config.turn_transport {
+            TurnTransportMode::Udp => self.run_udp_with_notify(cancel_rx, on_allocated).await,
+            TurnTransportMode::Tcp | TurnTransportMode::Tls => {
+                self.run_stream_with_notify(cancel_rx, on_allocated).await
+            }
+            TurnTransportMode::Auto => {
+                let use_stream = self.probe_should_use_stream().await;
+                if use_stream {
+                    info!("Auto-selection: UDP unreachable or high loss, selecting TLS stream");
+                    self.config.turn_transport = TurnTransportMode::Tls;
+                    self.run_stream_with_notify(cancel_rx, on_allocated).await
+                } else {
+                    info!("Auto-selection: UDP reachable, selecting UDP datagram transport");
+                    self.config.turn_transport = TurnTransportMode::Udp;
+                    self.run_udp_with_notify(cancel_rx, on_allocated).await
+                }
+            }
+        }
+    }
+
+    async fn probe_should_use_stream(&self) -> bool {
+        let turn_cfg = TurnClientConfig {
+            server_addr: self.config.turn_server_addr,
+            peer_addr: self.config.server_relayed_addr,
+            username: self.config.turn_username.clone(),
+            password: self.config.turn_password.clone(),
+            channel_number: 0x4000,
+            lifetime_sec: 60,
+        };
+        let probe_fut = async {
+            let mut client = TurnClient::bind("0.0.0.0:0".parse().unwrap(), turn_cfg).await?;
+            client.allocate_relay().await
+        };
+        !matches!(
+            tokio::time::timeout(Duration::from_millis(1500), probe_fut).await,
+            Ok(Ok(_))
+        )
+    }
+
+    async fn run_udp_with_notify(
         &mut self,
         mut cancel_rx: watch::Receiver<bool>,
         on_allocated: Option<tokio::sync::oneshot::Sender<SocketAddr>>,
     ) -> Result<(), TunnelError> {
         info!(
-            "Starting TunnelClient: relaying to {} via TURN {}",
+            "Starting TunnelClient (UDP mode): relaying to {} via TURN {}",
             self.config.server_relayed_addr, self.config.turn_server_addr
         );
 
@@ -196,19 +520,24 @@ impl TunnelClient {
         let my_relayed = turn_client.allocate_relay().await?;
         info!("Client allocated relay address: {my_relayed}");
 
-        if let Some(tx) = on_allocated {
-            let _ = tx.send(my_relayed);
-        }
-
         turn_client
             .bind_peer(self.config.server_relayed_addr)
             .await?;
         info!("Client bound peer {}", self.config.server_relayed_addr);
 
         // Derive dynamic refresh intervals from negotiated TURN LIFETIME
-        let mut alloc_refresh_timer = interval(turn_client.allocation_refresh_interval());
-        let mut perm_refresh_timer = interval(turn_client.permission_refresh_interval());
-        let mut chan_bind_refresh_timer = interval(turn_client.channel_bind_refresh_interval());
+        let mut alloc_refresh_timer = tokio::time::interval_at(
+            tokio::time::Instant::now() + turn_client.allocation_refresh_interval(),
+            turn_client.allocation_refresh_interval(),
+        );
+        let mut perm_refresh_timer = tokio::time::interval_at(
+            tokio::time::Instant::now() + turn_client.permission_refresh_interval(),
+            turn_client.permission_refresh_interval(),
+        );
+        let mut chan_bind_refresh_timer = tokio::time::interval_at(
+            tokio::time::Instant::now() + turn_client.channel_bind_refresh_interval(),
+            turn_client.channel_bind_refresh_interval(),
+        );
 
         // Send Pre-Auth Knock
         let knock_key = derive_pre_auth_knock_key(&Psk::from_bytes(self.config.psk));
@@ -234,7 +563,11 @@ impl TunnelClient {
             &mut knock_frame,
         );
         turn_client.send_channel_data(&knock_frame).await?;
-        debug!("Pre-Auth knock sent to server");
+        info!("Pre-Auth knock sent to server");
+
+        if let Some(tx) = on_allocated {
+            let _ = tx.send(my_relayed);
+        }
 
         let batched_wg = BatchedUdpSocket::new(wg_socket.clone());
         let batched_turn = BatchedUdpSocket::new(turn_client.socket().clone());
@@ -253,6 +586,31 @@ impl TunnelClient {
         let mut turn_batch_metas: Vec<RecvMeta> = vec![RecvMeta::default(); BATCH_SIZE];
         let mut tick_timer = interval(RESEQUENCER_TICK_INTERVAL);
 
+        let mut adaptive_keepalive =
+            AdaptiveKeepalive::new(AdaptiveKeepaliveConfig::default(), Instant::now());
+        let mut last_chaff_activity = Instant::now();
+
+        let mut powersave_deadline =
+            tokio::time::Instant::now() + adaptive_keepalive.current_interval();
+        let powersave_sleep = tokio::time::sleep_until(powersave_deadline);
+        tokio::pin!(powersave_sleep);
+
+        let mut chaff_ticker = interval(Duration::from_millis(20));
+        chaff_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        let mut consecutive_losses: u32 = 0;
+
+        // Coalescing buffers for client
+        let mut pending_turn_frames: Vec<BytesMut> = Vec::with_capacity(BATCH_SIZE);
+        let mut coalesce_turn_deadline: Option<tokio::time::Instant> = None;
+        let coalesce_turn_sleep = tokio::time::sleep(Duration::from_secs(3600));
+        tokio::pin!(coalesce_turn_sleep);
+
+        let mut pending_wg_frames: Vec<BytesMut> = Vec::with_capacity(BATCH_SIZE);
+        let mut coalesce_wg_deadline: Option<tokio::time::Instant> = None;
+        let coalesce_wg_sleep = tokio::time::sleep(Duration::from_secs(3600));
+        tokio::pin!(coalesce_wg_sleep);
+
         loop {
             tokio::select! {
                 _ = cancel_rx.changed() => {
@@ -270,6 +628,136 @@ impl TunnelClient {
                             let _ = wg_socket.send_to(&pkt, target).await;
                         }
                     }
+                }
+
+                () = &mut powersave_sleep, if self.config.keepalive_mode == KeepaliveMode::PowerSave => {
+                    let now = Instant::now();
+                    if adaptive_keepalive.has_pending_probe() {
+                        warn!("Keepalive probe timed out, rolling back to floor");
+                        adaptive_keepalive.on_loss(now);
+                        consecutive_losses += 1;
+                        if consecutive_losses >= 3 {
+                            warn!("3 consecutive keepalive timeouts; attempting reconnection...");
+                            if let Ok(new_relayed) = turn_client.reconnect().await {
+                                info!("TunnelClient successfully reconnected to TURN relay at {new_relayed}");
+                                let now_sec = SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs();
+                                let mut client_nonce = [0u8; 16];
+                                let mut session_id = [0u8; 16];
+                                rand::rng().fill_bytes(&mut client_nonce);
+                                rand::rng().fill_bytes(&mut session_id);
+                                let knock_wire = auth.generate_knock_packet(now_sec, &client_nonce, &session_id, 32);
+                                let mut knock_frame = BytesMut::new();
+                                encode_frame(FrameType::HandshakeInit, 0, 0, 0, &knock_wire, &mut knock_frame);
+                                let _ = turn_client.send_channel_data(&knock_frame).await;
+                                consecutive_losses = 0;
+                            }
+                        }
+                        powersave_deadline = tokio::time::Instant::now() + adaptive_keepalive.current_interval();
+                        powersave_sleep.as_mut().reset(powersave_deadline);
+                    } else {
+                        let now_ms = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64;
+                        let probe_id = seq_tx;
+                        let ping = PingPayload {
+                            timestamp: now_ms,
+                            probe_id,
+                        };
+                        let mut pbuf = [0u8; PingPayload::LEN];
+                        ping.encode(&mut pbuf);
+                        let mut ping_frame = BytesMut::new();
+                        encode_frame(
+                            FrameType::Ping,
+                            0,
+                            0,
+                            probe_id,
+                            &pbuf,
+                            &mut ping_frame,
+                        );
+                        seq_tx = seq_tx.wrapping_add(1);
+
+                        if let Err(e) = turn_client.send_channel_data(&ping_frame).await {
+                            warn!("Failed to send Keepalive Ping: {e}");
+                            adaptive_keepalive.on_loss(now);
+                            powersave_deadline = tokio::time::Instant::now() + adaptive_keepalive.current_interval();
+                        } else {
+                            self.metrics.record_ping_tx();
+                            adaptive_keepalive.record_probe_sent(probe_id, now);
+                            powersave_deadline = tokio::time::Instant::now() + adaptive_keepalive.probe_timeout();
+                        }
+                        powersave_sleep.as_mut().reset(powersave_deadline);
+                    }
+                }
+
+                _ = chaff_ticker.tick(), if self.config.keepalive_mode == KeepaliveMode::Chaff => {
+                    let now = Instant::now();
+                    if now.saturating_duration_since(last_chaff_activity) >= Duration::from_millis(18) {
+                        let now_ms = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64;
+                        let ping = PingPayload {
+                            timestamp: now_ms,
+                            probe_id: seq_tx,
+                        };
+                        let mut pbuf = [0u8; PingPayload::LEN];
+                        ping.encode(&mut pbuf);
+
+                        let pad_len = 60 + ((now_ms ^ (seq_tx as u64)) % 81) as usize;
+                        let mut chaff_payload = Vec::with_capacity(PingPayload::LEN + pad_len);
+                        chaff_payload.extend_from_slice(&pbuf);
+                        chaff_payload.resize(PingPayload::LEN + pad_len, 0xAA);
+
+                        let mut frame = BytesMut::new();
+                        encode_frame(
+                            FrameType::Ping,
+                            flags::PADDING_PRESENT,
+                            0,
+                            seq_tx,
+                            &chaff_payload,
+                            &mut frame,
+                        );
+                        seq_tx = seq_tx.wrapping_add(1);
+
+                        if let Err(e) = turn_client.send_channel_data(&frame).await {
+                            warn!("Failed to send Chaff Ping: {e}");
+                        } else {
+                            self.metrics.record_ping_tx();
+                        }
+                        last_chaff_activity = now;
+                    }
+                }
+
+                () = &mut coalesce_turn_sleep, if coalesce_turn_deadline.is_some() => {
+                    if !pending_turn_frames.is_empty() {
+                        let pkts: Vec<TransmitPacket> = pending_turn_frames.iter().map(|b| TransmitPacket {
+                            buf: b,
+                            addr: self.config.turn_server_addr,
+                            gso_segment_size: None,
+                        }).collect();
+                        let _ = batched_turn.send_batch(&pkts).await;
+                        pending_turn_frames.clear();
+                    }
+                    coalesce_turn_deadline = None;
+                }
+
+                () = &mut coalesce_wg_sleep, if coalesce_wg_deadline.is_some() => {
+                    if !pending_wg_frames.is_empty() {
+                        if let Some(target) = wg_peer_addr {
+                            let pkts: Vec<TransmitPacket> = pending_wg_frames.iter().map(|b| TransmitPacket {
+                                buf: b,
+                                addr: target,
+                                gso_segment_size: None,
+                            }).collect();
+                            let _ = batched_wg.send_batch(&pkts).await;
+                        }
+                        pending_wg_frames.clear();
+                    }
+                    coalesce_wg_deadline = None;
                 }
 
                 _ = alloc_refresh_timer.tick() => {
@@ -298,6 +786,16 @@ impl TunnelClient {
                 read_res = batched_wg.recv_batch(&mut wg_batch_bufs, &mut wg_batch_metas) => {
                     match read_res {
                         Ok(count) => {
+                            self.metrics.record_batch_rx(count);
+                            if count > 0 {
+                                let now = Instant::now();
+                                last_chaff_activity = now;
+                                adaptive_keepalive.on_tx(now);
+                                if self.config.keepalive_mode == KeepaliveMode::PowerSave && !adaptive_keepalive.has_pending_probe() {
+                                    powersave_deadline = tokio::time::Instant::now() + adaptive_keepalive.current_interval();
+                                    powersave_sleep.as_mut().reset(powersave_deadline);
+                                }
+                            }
                             for i in 0..count {
                                 let meta = wg_batch_metas[i];
                                 wg_peer_addr = Some(meta.addr);
@@ -307,11 +805,37 @@ impl TunnelClient {
                                 encode_frame(FrameType::Data, 0, 0, seq_tx, payload, &mut frame);
                                 seq_tx = seq_tx.wrapping_add(1);
 
-                                if let Err(e) = turn_client.send_channel_data(&frame).await {
-                                    warn!("Failed to forward WG packet to TURN: {e}");
-                                } else {
+                                let mut chan_buf = BytesMut::new();
+                                if encode_channel_data(turn_client.channel_number(), &frame, false, &mut chan_buf).is_ok() {
+                                    pending_turn_frames.push(chan_buf);
                                     self.metrics.record_tx(meta.len);
                                 }
+                            }
+
+                            if let Some(window) = self.config.coalesce_window {
+                                if pending_turn_frames.len() >= BATCH_SIZE {
+                                    let pkts: Vec<TransmitPacket> = pending_turn_frames.iter().map(|b| TransmitPacket {
+                                        buf: b,
+                                        addr: self.config.turn_server_addr,
+                                        gso_segment_size: None,
+                                    }).collect();
+                                    let _ = batched_turn.send_batch(&pkts).await;
+                                    pending_turn_frames.clear();
+                                    coalesce_turn_deadline = None;
+                                } else if !pending_turn_frames.is_empty() && coalesce_turn_deadline.is_none() {
+                                    let d = tokio::time::Instant::now() + window;
+                                    coalesce_turn_deadline = Some(d);
+                                    coalesce_turn_sleep.as_mut().reset(d);
+                                }
+                            } else if !pending_turn_frames.is_empty() {
+                                trace!("TunnelClient sending {} frames to TURN {}", pending_turn_frames.len(), self.config.turn_server_addr);
+                                let pkts: Vec<TransmitPacket> = pending_turn_frames.iter().map(|b| TransmitPacket {
+                                    buf: b,
+                                    addr: self.config.turn_server_addr,
+                                    gso_segment_size: None,
+                                }).collect();
+                                let _ = batched_turn.send_batch(&pkts).await;
+                                pending_turn_frames.clear();
                             }
                         }
                         Err(e) => {
@@ -324,41 +848,86 @@ impl TunnelClient {
                 turn_batch_res = batched_turn.recv_batch(&mut turn_batch_bufs, &mut turn_batch_metas) => {
                     match turn_batch_res {
                         Ok(count) => {
+                            self.metrics.record_batch_rx(count);
                             for i in 0..count {
                                 let meta = turn_batch_metas[i];
                                 let slice = &turn_batch_bufs[i][..meta.len];
-                                if let Ok(Some(TurnIncoming::ChannelData { payload, .. })) =
-                                    turn_client.parse_incoming(slice, meta.addr)
+                                let incoming = turn_client.parse_incoming(slice, meta.addr);
+                                let payload = match incoming {
+                                    Ok(Some(TurnIncoming::ChannelData { payload, .. })) => Some(payload),
+                                    Ok(Some(TurnIncoming::DataIndication { payload, .. })) => Some(payload),
+                                    _ => None,
+                                };
+                                if let Some(payload) = payload
                                     && let Ok((view, _)) = FrameView::decode(&payload)
                                 {
+                                        trace!("TunnelClient received frame type: {:?}", view.header.frame_type);
                                         match view.header.frame_type {
                                             FrameType::Data => {
                                                 let data_payload = view.payload;
+                                                adaptive_keepalive.on_rx_data(Instant::now());
                                                 self.metrics.record_rx(data_payload.len());
 
-                                                if let Some(target) = wg_peer_addr {
-                                                    if let Ok(wg_hdr) = inspect_wg_packet(data_payload) {
-                                                        if wg_hdr.is_data()
-                                                            && let (Some(rcv_idx), Some(counter)) =
-                                                                (wg_hdr.receiver_index, wg_hdr.counter)
-                                                        {
-                                                            let mut ordered = Vec::new();
-                                                            resequencer.push(
-                                                                rcv_idx,
-                                                                counter,
-                                                                bytes::Bytes::copy_from_slice(data_payload),
-                                                                Instant::now(),
-                                                                &mut ordered,
-                                                            );
-                                                            for pkt in ordered {
-                                                                let _ = wg_socket.send_to(&pkt, target).await;
-                                                            }
-                                                        } else {
-                                                            // WireGuard handshake bypass
-                                                            let _ = wg_socket.send_to(data_payload, target).await;
+                                                if let Ok(wg_hdr) = inspect_wg_packet(data_payload) {
+                                                    if wg_hdr.is_data()
+                                                        && let (Some(rcv_idx), Some(counter)) =
+                                                            (wg_hdr.receiver_index, wg_hdr.counter)
+                                                    {
+                                                        let mut ordered = Vec::new();
+                                                        resequencer.push(
+                                                            rcv_idx,
+                                                            counter,
+                                                            bytes::Bytes::copy_from_slice(data_payload),
+                                                            Instant::now(),
+                                                            &mut ordered,
+                                                        );
+                                                        for pkt in ordered {
+                                                            let mut b = BytesMut::new();
+                                                            b.extend_from_slice(&pkt);
+                                                            pending_wg_frames.push(b);
                                                         }
                                                     } else {
-                                                        let _ = wg_socket.send_to(data_payload, target).await;
+                                                        let mut b = BytesMut::new();
+                                                        b.extend_from_slice(data_payload);
+                                                        pending_wg_frames.push(b);
+                                                    }
+                                                } else {
+                                                    let mut b = BytesMut::new();
+                                                    b.extend_from_slice(data_payload);
+                                                    pending_wg_frames.push(b);
+                                                }
+                                            }
+                                            FrameType::Pong => {
+                                                if let Ok(pong) = PongPayload::decode(view.payload) {
+                                                    let now = Instant::now();
+                                                    let now_ms = SystemTime::now()
+                                                        .duration_since(UNIX_EPOCH)
+                                                        .unwrap_or_default()
+                                                        .as_millis() as u64;
+                                                    let rtt = now_ms.saturating_sub(pong.echo_timestamp);
+                                                    self.metrics.record_rtt_sample(rtt);
+                                                    if adaptive_keepalive.on_pong(pong.probe_id, now) {
+                                                        consecutive_losses = 0;
+                                                        let confirmed_sec =
+                                                            adaptive_keepalive.confirmed_interval().as_secs();
+                                                        self.metrics.record_confirmed_keepalive(confirmed_sec);
+                                                        if self.config.keepalive_mode == KeepaliveMode::PowerSave {
+                                                            powersave_deadline = tokio::time::Instant::now()
+                                                                + adaptive_keepalive.current_interval();
+                                                            powersave_sleep.as_mut().reset(powersave_deadline);
+                                                        }
+                                                        trace!(
+                                                            "Client received Pong #{} (RTT: {} ms), confirmed keepalive {}s, next probe in {}s",
+                                                            pong.probe_id,
+                                                            rtt,
+                                                            confirmed_sec,
+                                                            adaptive_keepalive.current_interval().as_secs()
+                                                        );
+                                                    } else {
+                                                        trace!(
+                                                            "Client received Pong #{} (RTT: {} ms)",
+                                                            pong.probe_id, rtt
+                                                        );
                                                     }
                                                 }
                                             }
@@ -367,9 +936,37 @@ impl TunnelClient {
                                             }
                                             _ => {}
                                         }
-                                    }
                                 }
                             }
+
+                            if let Some(target) = wg_peer_addr {
+                                if let Some(window) = self.config.coalesce_window {
+                                    if pending_wg_frames.len() >= BATCH_SIZE {
+                                        let pkts: Vec<TransmitPacket> = pending_wg_frames.iter().map(|b| TransmitPacket {
+                                            buf: b,
+                                            addr: target,
+                                            gso_segment_size: None,
+                                        }).collect();
+                                        let _ = batched_wg.send_batch(&pkts).await;
+                                        pending_wg_frames.clear();
+                                        coalesce_wg_deadline = None;
+                                    } else if !pending_wg_frames.is_empty() && coalesce_wg_deadline.is_none() {
+                                        let d = tokio::time::Instant::now() + window;
+                                        coalesce_wg_deadline = Some(d);
+                                        coalesce_wg_sleep.as_mut().reset(d);
+                                    }
+                                } else if !pending_wg_frames.is_empty() {
+                                    trace!("TunnelClient forwarding {} packets to WG target {}", pending_wg_frames.len(), target);
+                                    let pkts: Vec<TransmitPacket> = pending_wg_frames.iter().map(|b| TransmitPacket {
+                                        buf: b,
+                                        addr: target,
+                                        gso_segment_size: None,
+                                    }).collect();
+                                    let _ = batched_wg.send_batch(&pkts).await;
+                                    pending_wg_frames.clear();
+                                }
+                            }
+                        }
                         Err(e) => {
                             trace!("TURN recv incoming notice: {e}");
                         }
@@ -381,10 +978,1602 @@ impl TunnelClient {
         Ok(())
     }
 
+    async fn run_stream_with_notify(
+        &mut self,
+        mut cancel_rx: watch::Receiver<bool>,
+        on_allocated: Option<tokio::sync::oneshot::Sender<SocketAddr>>,
+    ) -> Result<(), TunnelError> {
+        info!(
+            "Starting TunnelClient (Stream mode {:?}): relaying to {} via TURN {}",
+            self.config.turn_transport,
+            self.config.server_relayed_addr,
+            self.config.turn_server_addr
+        );
+
+        let wg_socket = Arc::new(bind_tuned_udp_socket(self.config.wg_listen_addr)?);
+        info!("WireGuard bridge listening on {}", wg_socket.local_addr()?);
+
+        let mut pool = self.establish_stream_pool().await?;
+        let mut guard = pool.acquire().await?;
+        let my_relayed = guard
+            .relayed_addr()
+            .ok_or_else(|| TunnelError::Timeout("stream has no relayed address".into()))?;
+
+        let mut alloc_refresh_timer = tokio::time::interval_at(
+            tokio::time::Instant::now() + guard.allocation_refresh_interval(),
+            guard.allocation_refresh_interval(),
+        );
+        let mut perm_refresh_timer = tokio::time::interval_at(
+            tokio::time::Instant::now() + guard.permission_refresh_interval(),
+            guard.permission_refresh_interval(),
+        );
+        let mut chan_bind_refresh_timer = tokio::time::interval_at(
+            tokio::time::Instant::now() + guard.channel_bind_refresh_interval(),
+            guard.channel_bind_refresh_interval(),
+        );
+        let mut prune_timer = interval(STREAM_POOL_PRUNE_INTERVAL);
+
+        if let Some(tx) = on_allocated {
+            let _ = tx.send(my_relayed);
+        }
+
+        let batched_wg = BatchedUdpSocket::new(wg_socket.clone());
+        let mut resequencer = WgResequencer::new(4096, Duration::from_millis(15));
+        let mut wg_peer_addr: Option<SocketAddr> = None;
+        let mut seq_tx: u16 = 0;
+
+        const BATCH_SIZE: usize = 16;
+        let mut wg_batch_bufs: Vec<Vec<u8>> =
+            (0..BATCH_SIZE).map(|_| vec![0u8; MAX_PACKET_LEN]).collect();
+        let mut wg_batch_metas: Vec<RecvMeta> = vec![RecvMeta::default(); BATCH_SIZE];
+
+        let mut tick_timer = interval(RESEQUENCER_TICK_INTERVAL);
+        let mut adaptive_keepalive =
+            AdaptiveKeepalive::new(AdaptiveKeepaliveConfig::default(), Instant::now());
+        let mut powersave_deadline =
+            tokio::time::Instant::now() + adaptive_keepalive.current_interval();
+        let powersave_sleep = tokio::time::sleep_until(powersave_deadline);
+        tokio::pin!(powersave_sleep);
+
+        let mut backoff = Backoff::default();
+        let mut shutting_down = false;
+
+        'reconnect: loop {
+            let outcome: Result<(), TunnelError> = loop {
+                tokio::select! {
+                    biased;
+
+                    _ = cancel_rx.changed() => {
+                        if *cancel_rx.borrow() {
+                            info!("TunnelClient stream shutting down via cancel signal");
+                            shutting_down = true;
+                            break Ok(());
+                        }
+                    }
+
+                    _ = alloc_refresh_timer.tick() => {
+                        let requested_sec = guard.negotiated_lifetime();
+                        trace!("Stream TURN allocation refreshing ({requested_sec}s)");
+                        if let Err(e) = guard.refresh_allocation(requested_sec).await {
+                            warn!("Failed to refresh stream TURN allocation: {e}");
+                        }
+                    }
+
+                    _ = perm_refresh_timer.tick() => {
+                        trace!("Stream TURN permission refreshing");
+                        if let Err(e) = guard.refresh_permission().await {
+                            warn!("Failed to refresh stream TURN permission: {e}");
+                        }
+                    }
+
+                    _ = chan_bind_refresh_timer.tick() => {
+                        trace!("Stream TURN channel bind refreshing");
+                        if let Err(e) = guard.refresh_channel_bind().await {
+                            warn!("Failed to refresh stream TURN channel bind: {e}");
+                        }
+                    }
+
+                    _ = prune_timer.tick() => {
+                        // The checked-out stream is skipped by the probe, so
+                        // this only retires idle streams that stopped answering.
+                        pool.probe_and_prune().await;
+                    }
+
+                    _ = tick_timer.tick(), if !resequencer.is_empty() => {
+                        let mut timed_out = Vec::new();
+                        resequencer.tick(Instant::now(), &mut timed_out);
+                        if let Some(target) = wg_peer_addr {
+                            for pkt in timed_out {
+                                let _ = wg_socket.send_to(&pkt, target).await;
+                            }
+                        }
+                    }
+
+                    () = &mut powersave_sleep, if self.config.keepalive_mode == KeepaliveMode::PowerSave => {
+                        let now = Instant::now();
+                        if adaptive_keepalive.has_pending_probe() {
+                            adaptive_keepalive.on_loss(now);
+                            powersave_deadline = tokio::time::Instant::now() + adaptive_keepalive.current_interval();
+                            powersave_sleep.as_mut().reset(powersave_deadline);
+                        } else {
+                            let now_ms = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis() as u64;
+                            let probe_id = seq_tx;
+                            let ping = PingPayload {
+                                timestamp: now_ms,
+                                probe_id,
+                            };
+                            let mut pbuf = [0u8; PingPayload::LEN];
+                            ping.encode(&mut pbuf);
+                            let mut ping_frame = BytesMut::new();
+                            encode_frame(
+                                FrameType::Ping,
+                                0,
+                                0,
+                                probe_id,
+                                &pbuf,
+                                &mut ping_frame,
+                            );
+                            seq_tx = seq_tx.wrapping_add(1);
+                            if let Err(e) = guard.send_channel_data(&ping_frame).await {
+                                warn!("Failed to send Keepalive Ping over stream: {e}");
+                                adaptive_keepalive.on_loss(now);
+                            } else {
+                                self.metrics.record_ping_tx();
+                                adaptive_keepalive.record_probe_sent(probe_id, now);
+                            }
+                            powersave_deadline = tokio::time::Instant::now() + adaptive_keepalive.current_interval();
+                            powersave_sleep.as_mut().reset(powersave_deadline);
+                        }
+                    }
+
+                    // Packets from WireGuard -> send over stream
+                    wg_batch_res = batched_wg.recv_batch(&mut wg_batch_bufs, &mut wg_batch_metas) => {
+                        match wg_batch_res {
+                            Ok(count) => {
+                                self.metrics.record_batch_rx(count);
+                                for i in 0..count {
+                                    let meta = wg_batch_metas[i];
+                                    wg_peer_addr = Some(meta.addr);
+                                    let payload = &wg_batch_bufs[i][..meta.len];
+
+                                    let mut frame = BytesMut::new();
+                                    encode_frame(FrameType::Data, 0, 0, seq_tx, payload, &mut frame);
+                                    seq_tx = seq_tx.wrapping_add(1);
+
+                                    if let Err(e) = guard.send_channel_data(&frame).await {
+                                        warn!("Failed to send ChannelData over stream: {e}");
+                                    } else {
+                                        self.metrics.record_tx(meta.len);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                trace!("WG recv_batch error: {e}");
+                            }
+                        }
+                    }
+
+                    // Incoming frames from stream -> forward to WireGuard
+                    stream_msg_res = guard.recv_frame() => {
+                        match stream_msg_res {
+                            Ok(turn_incoming) => {
+                                let payload = match turn_incoming {
+                                    TurnIncoming::ChannelData { payload, .. } => payload,
+                                    TurnIncoming::DataIndication { payload, .. } => payload,
+                                    _ => bytes::Bytes::new(),
+                                };
+
+                                if payload.is_empty() {
+                                    continue;
+                                }
+
+                                if let Ok((view, _)) = FrameView::decode(&payload) {
+                                    match view.header.frame_type {
+                                        FrameType::Data => {
+                                            let data_payload = view.payload;
+                                            adaptive_keepalive.on_rx_data(Instant::now());
+                                            self.metrics.record_rx(data_payload.len());
+
+                                            if let Ok(wg_hdr) = inspect_wg_packet(data_payload) {
+                                                if wg_hdr.is_data()
+                                                    && let (Some(rcv_idx), Some(counter)) =
+                                                        (wg_hdr.receiver_index, wg_hdr.counter)
+                                                {
+                                                    let mut ordered = Vec::new();
+                                                    resequencer.push(
+                                                        rcv_idx,
+                                                        counter,
+                                                        bytes::Bytes::copy_from_slice(data_payload),
+                                                        Instant::now(),
+                                                        &mut ordered,
+                                                    );
+                                                    if let Some(target) = wg_peer_addr {
+                                                        for pkt in ordered {
+                                                            let _ = wg_socket.send_to(&pkt, target).await;
+                                                        }
+                                                    }
+                                                } else if let Some(target) = wg_peer_addr {
+                                                    let _ = wg_socket.send_to(data_payload, target).await;
+                                                }
+                                            } else if let Some(target) = wg_peer_addr {
+                                                let _ = wg_socket.send_to(data_payload, target).await;
+                                            }
+                                        }
+                                        FrameType::Pong => {
+                                            if let Ok(pong) = PongPayload::decode(view.payload) {
+                                                let now = Instant::now();
+                                                let now_ms = SystemTime::now()
+                                                    .duration_since(UNIX_EPOCH)
+                                                    .unwrap_or_default()
+                                                    .as_millis() as u64;
+                                                let rtt = now_ms.saturating_sub(pong.echo_timestamp);
+                                                self.metrics.record_rtt_sample(rtt);
+                                                if adaptive_keepalive.on_pong(pong.probe_id, now) {
+                                                    let confirmed_sec =
+                                                        adaptive_keepalive.confirmed_interval().as_secs();
+                                                    self.metrics.record_confirmed_keepalive(confirmed_sec);
+                                                }
+                                            }
+                                        }
+                                        FrameType::HandshakeResp => {
+                                            info!("Pre-Auth handshake confirmed by server over stream!");
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!("StreamTurnClient error: {e}");
+                                break Err(TunnelError::Turn(e));
+                            }
+                        }
+                    }
+                }
+            };
+
+            match outcome {
+                Ok(()) => {
+                    if shutting_down {
+                        return Ok(());
+                    }
+                    // The loop only ends cleanly on shutdown, so reaching here
+                    // without the flag means the datapath is gone.
+                    return Ok(());
+                }
+                Err(e) => {
+                    let text = e.to_string();
+                    if classify(&text) == Recovery::GiveUp {
+                        error!("Tunnel transport failed permanently: {text}");
+                        return Err(e);
+                    }
+
+                    let Some(delay) = backoff.next_delay() else {
+                        error!(
+                            "Giving up after {} reconnection attempts: {text}",
+                            backoff.attempts()
+                        );
+                        return Err(e);
+                    };
+
+                    warn!(
+                        "Tunnel transport lost ({text}); reconnecting in {:.1}s (attempt {})",
+                        delay.as_secs_f64(),
+                        backoff.attempts()
+                    );
+
+                    tokio::select! {
+                        _ = tokio::time::sleep(delay) => {}
+                        _ = cancel_rx.changed() => {
+                            if *cancel_rx.borrow() {
+                                info!("TunnelClient stream shutting down during reconnect");
+                                return Ok(());
+                            }
+                        }
+                    }
+
+                    // The checked-out stream failed; retire it and let the pool
+                    // refill before we try to reconnect.
+                    guard.release(&mut pool, false).await;
+
+                    match self.establish_stream_pool().await {
+                        Ok(new_pool) => {
+                            pool = new_pool;
+                            match pool.acquire().await {
+                                Ok(new_guard) => {
+                                    guard = new_guard;
+                                    let relayed = guard.relayed_addr();
+                                    info!("Reconnected to TURN relay at {relayed:?}");
+                                    alloc_refresh_timer = tokio::time::interval_at(
+                                        tokio::time::Instant::now()
+                                            + guard.allocation_refresh_interval(),
+                                        guard.allocation_refresh_interval(),
+                                    );
+                                    perm_refresh_timer = tokio::time::interval_at(
+                                        tokio::time::Instant::now()
+                                            + guard.permission_refresh_interval(),
+                                        guard.permission_refresh_interval(),
+                                    );
+                                    chan_bind_refresh_timer = tokio::time::interval_at(
+                                        tokio::time::Instant::now()
+                                            + guard.channel_bind_refresh_interval(),
+                                        guard.channel_bind_refresh_interval(),
+                                    );
+                                    backoff.reset();
+                                    continue 'reconnect;
+                                }
+                                Err(e) => {
+                                    warn!("Reconnection attempt failed: {e}");
+                                    continue 'reconnect;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Reconnection attempt failed: {e}");
+                            continue 'reconnect;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Run the client datapath with a real TUN device and in-process WireGuard.
+    ///
+    /// The TUN interface carries plain IP packets; [`WgEngine`] encrypts them
+    /// and the resulting datagrams ride the same TURN transport as the UDP
+    /// bridge mode. Requires `tun_name`, `wg_private_key` and
+    /// `wg_peer_public_key` in the config.
+    async fn run_tun_with_notify(
+        &mut self,
+        cancel_rx: watch::Receiver<bool>,
+        on_allocated: Option<tokio::sync::oneshot::Sender<SocketAddr>>,
+    ) -> Result<(), TunnelError> {
+        let tun_name = self
+            .config
+            .tun_name
+            .clone()
+            .ok_or_else(|| TunnelError::Timeout("tun_name missing".into()))?;
+        let private = self
+            .config
+            .wg_private_key
+            .clone()
+            .ok_or_else(|| TunnelError::Timeout("wg_private_key missing".into()))?;
+        let peer = self
+            .config
+            .wg_peer_public_key
+            .clone()
+            .ok_or_else(|| TunnelError::Timeout("wg_peer_public_key missing".into()))?;
+
+        let engine = wdtt_tun::WgEngine::from_base64(
+            &private,
+            &peer,
+            self.config.wg_preshared_key.as_deref(),
+            self.config.wg_keepalive,
+            1,
+        )?;
+
+        info!(
+            "Starting TunnelClient (TUN mode): {} <-> WG <-> TURN {}",
+            tun_name, self.config.turn_server_addr
+        );
+
+        let mut pool = self.establish_stream_pool().await?;
+        let mut guard = pool.acquire().await?;
+        let my_relayed = guard
+            .relayed_addr()
+            .ok_or_else(|| TunnelError::Timeout("stream has no relayed address".into()))?;
+
+        if let Some(tx) = on_allocated {
+            let _ = tx.send(my_relayed);
+        }
+
+        let mut alloc_refresh_timer = tokio::time::interval_at(
+            tokio::time::Instant::now() + guard.allocation_refresh_interval(),
+            guard.allocation_refresh_interval(),
+        );
+        let mut perm_refresh_timer = tokio::time::interval_at(
+            tokio::time::Instant::now() + guard.permission_refresh_interval(),
+            guard.permission_refresh_interval(),
+        );
+        let mut chan_bind_refresh_timer = tokio::time::interval_at(
+            tokio::time::Instant::now() + guard.channel_bind_refresh_interval(),
+            guard.channel_bind_refresh_interval(),
+        );
+        let mut prune_timer = interval(STREAM_POOL_PRUNE_INTERVAL);
+
+        let (wg_tx, mut wg_rx) = mpsc::channel::<Vec<u8>>(1024);
+        let (in_tx, in_rx) = mpsc::channel::<Vec<u8>>(1024);
+        let mut seq_tx: u16 = 0;
+
+        let send_wg = move |datagram: Vec<u8>| -> crate::tun_datapath::BoxFut<'static, Result<(), TunnelError>> {
+            let tx = wg_tx.clone();
+            Box::pin(async move {
+                tx.send(datagram)
+                    .await
+                    .map_err(|_| TunnelError::Timeout("WG queue closed".into()))
+            })
+        };
+        let in_rx = Arc::new(tokio::sync::Mutex::new(in_rx));
+        let recv_wg = move || -> crate::tun_datapath::BoxFut<'static, Option<Vec<u8>>> {
+            let rx = in_rx.clone();
+            Box::pin(async move { rx.lock().await.recv().await })
+        };
+
+        let dp_cfg = crate::tun_datapath::TunDatapathConfig {
+            tun_name,
+            tun_mtu: self.config.tun_mtu,
+            persistent_keepalive: self.config.wg_keepalive,
+        };
+        let dp_cancel = cancel_rx.clone();
+        let mut datapath = tokio::spawn(async move {
+            crate::tun_datapath::run_tun_datapath(dp_cfg, engine, send_wg, recv_wg, dp_cancel).await
+        });
+
+        let mut cancel_rx = cancel_rx;
+        let mut backoff = Backoff::default();
+        let result = loop {
+            // The inner loop runs one connection's lifetime. A transport error
+            // breaks out of it with `Err`, and the outer loop decides whether
+            // to reconnect; a clean shutdown or a dead datapath breaks the
+            // outer loop directly.
+            let outcome: Result<(), TunnelError> = loop {
+                tokio::select! {
+                    biased;
+
+                    _ = cancel_rx.changed() => {
+                        if *cancel_rx.borrow() {
+                            info!("TunnelClient TUN shutting down via cancel signal");
+                            break Ok(());
+                        }
+                    }
+
+                    // The datapath owns the TUN device. If it stops, the interface
+                    // disappears with it, so surface the reason instead of letting
+                    // the tunnel look alive while its device is gone.
+                    dp_result = &mut datapath => {
+                        match dp_result {
+                            Ok(Ok(())) => {
+                                warn!("TUN datapath stopped");
+                                break Ok(());
+                            }
+                            Ok(Err(e)) => {
+                                error!("TUN datapath failed: {e}");
+                                break Err(e);
+                            }
+                            Err(e) => {
+                                error!("TUN datapath task panicked: {e}");
+                                break Err(TunnelError::Timeout(format!("TUN datapath task failed: {e}")));
+                            }
+                        }
+                    }
+
+                    _ = alloc_refresh_timer.tick() => {
+                        let requested_sec = guard.negotiated_lifetime();
+                        if let Err(e) = guard.refresh_allocation(requested_sec).await {
+                            warn!("Failed to refresh stream TURN allocation: {e}");
+                        }
+                    }
+
+                    _ = perm_refresh_timer.tick() => {
+                        if let Err(e) = guard.refresh_permission().await {
+                            warn!("Failed to refresh stream TURN permission: {e}");
+                        }
+                    }
+
+                    _ = chan_bind_refresh_timer.tick() => {
+                        if let Err(e) = guard.refresh_channel_bind().await {
+                            warn!("Failed to refresh stream TURN channel bind: {e}");
+                        }
+                    }
+
+                    _ = prune_timer.tick() => {
+                        pool.probe_and_prune().await;
+                    }
+
+                    Some(datagram) = wg_rx.recv() => {
+                        let mut frame = BytesMut::new();
+                        encode_frame(FrameType::Data, 0, 0, seq_tx, &datagram, &mut frame);
+                        seq_tx = seq_tx.wrapping_add(1);
+                        if let Err(e) = guard.send_channel_data(&frame).await {
+                            warn!("Failed to send ChannelData over stream: {e}");
+                        } else {
+                            self.metrics.record_tx(datagram.len());
+                        }
+                    }
+
+                    stream_msg_res = guard.recv_frame() => {
+                        match stream_msg_res {
+                            Ok(turn_incoming) => {
+                                let payload = match turn_incoming {
+                                    TurnIncoming::ChannelData { payload, .. } => payload,
+                                    TurnIncoming::DataIndication { payload, .. } => payload,
+                                    _ => Bytes::new(),
+                                };
+                                if payload.is_empty() {
+                                    continue;
+                                }
+                                if let Ok((view, _)) = FrameView::decode(&payload) {
+                                    match view.header.frame_type {
+                                        FrameType::Data => {
+                                            self.metrics.record_rx(view.payload.len());
+                                            if in_tx.send(view.payload.to_vec()).await.is_err() {
+                                                warn!("TUN datapath closed, stopping");
+                                                break Ok(());
+                                            }
+                                        }
+                                        FrameType::HandshakeResp => {
+                                            info!("Pre-Auth handshake confirmed by server over stream!");
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!("StreamTurnClient error: {e}");
+                                break Err(TunnelError::Turn(e));
+                            }
+                        }
+                    }
+                }
+            };
+
+            match outcome {
+                Ok(()) => break Ok(()),
+                Err(e) => {
+                    // A datapath failure is not something a new allocation can
+                    // fix: the TUN device is gone, so the tunnel is over.
+                    if matches!(e, TunnelError::Timeout(_)) {
+                        break Err(e);
+                    }
+
+                    let text = e.to_string();
+                    if classify(&text) == Recovery::GiveUp {
+                        error!("Tunnel transport failed permanently: {text}");
+                        break Err(e);
+                    }
+
+                    let Some(delay) = backoff.next_delay() else {
+                        error!(
+                            "Giving up after {} reconnection attempts: {text}",
+                            backoff.attempts()
+                        );
+                        break Err(e);
+                    };
+
+                    warn!(
+                        "Tunnel transport lost ({text}); reconnecting in {:.1}s (attempt {})",
+                        delay.as_secs_f64(),
+                        backoff.attempts()
+                    );
+
+                    // Wait out the backoff, but stay responsive to shutdown.
+                    tokio::select! {
+                        _ = tokio::time::sleep(delay) => {}
+                        _ = cancel_rx.changed() => {
+                            if *cancel_rx.borrow() {
+                                info!("TunnelClient TUN shutting down during reconnect");
+                                break Ok(());
+                            }
+                        }
+                    }
+
+                    // The checked-out stream failed; retire it and let the pool
+                    // refill before we try to reconnect.
+                    guard.release(&mut pool, false).await;
+
+                    match self.establish_stream_pool().await {
+                        Ok(new_pool) => {
+                            pool = new_pool;
+                            match pool.acquire().await {
+                                Ok(new_guard) => {
+                                    guard = new_guard;
+                                    let relayed = guard.relayed_addr();
+                                    info!("Reconnected to TURN relay at {relayed:?}");
+
+                                    // The refresh timers were scheduled against the old
+                                    // allocation; restart them so they do not fire
+                                    // immediately against the new one.
+                                    alloc_refresh_timer = tokio::time::interval_at(
+                                        tokio::time::Instant::now()
+                                            + guard.allocation_refresh_interval(),
+                                        guard.allocation_refresh_interval(),
+                                    );
+                                    perm_refresh_timer = tokio::time::interval_at(
+                                        tokio::time::Instant::now()
+                                            + guard.permission_refresh_interval(),
+                                        guard.permission_refresh_interval(),
+                                    );
+                                    chan_bind_refresh_timer = tokio::time::interval_at(
+                                        tokio::time::Instant::now()
+                                            + guard.channel_bind_refresh_interval(),
+                                        guard.channel_bind_refresh_interval(),
+                                    );
+                                    backoff.reset();
+                                }
+                                Err(e) => {
+                                    warn!("Reconnection attempt failed: {e}");
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Reconnection attempt failed: {e}");
+                        }
+                    }
+                }
+            }
+        };
+
+        let _ = cancel_rx; // keep the receiver alive until shutdown
+        datapath.abort();
+        result
+    }
+
+    /// Establishes a pool of stream TURN allocations and sends the pre-auth knock.
+    ///
+    /// Split out of [`Self::run_tun_with_notify`] so the datapath can call it
+    /// again after a transport failure without duplicating the handshake. The
+    /// pool keeps several allocations alive so a single dead stream does not
+    /// take the tunnel down with it.
+    async fn establish_stream_pool(&mut self) -> Result<StreamPool, TunnelError> {
+        // If the credentials are at or near expiry, replace them before
+        // spending a connection attempt on a relay that will reject us.
+        self.refresh_credentials_if_stale().await?;
+        let stream_cfg = self.build_stream_config();
+
+        let pool = match self.try_establish_stream_pool(&stream_cfg).await {
+            Ok(pool) => pool,
+            Err(err) if err.is_auth_failure() && self.config.credential_refresher.is_some() => {
+                // The relay turned us down; the credentials have almost
+                // certainly lapsed. Force a refresh and try exactly once more.
+                self.refresh_credentials_now().await?;
+                let retry_cfg = self.build_stream_config();
+                self.try_establish_stream_pool(&retry_cfg).await?
+            }
+            Err(err) => return Err(err),
+        };
+
+        // Send the pre-auth knock on every stream so any of them can carry the
+        // session once it is checked out.
+        let knock_key = derive_pre_auth_knock_key(&Psk::from_bytes(self.config.psk));
+        let auth = KnockAuthenticator::new(knock_key, DEFAULT_MAX_CLOCK_SKEW_SEC);
+        let now_sec = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let mut client_nonce = [0u8; 16];
+        let mut session_id = [0u8; 16];
+        rand::rng().fill_bytes(&mut client_nonce);
+        rand::rng().fill_bytes(&mut session_id);
+
+        let knock_wire = auth.generate_knock_packet(now_sec, &client_nonce, &session_id, 32);
+        let mut knock_frame = BytesMut::new();
+        encode_frame(
+            FrameType::HandshakeInit,
+            0,
+            0,
+            0,
+            &knock_wire,
+            &mut knock_frame,
+        );
+
+        let mut pool = pool;
+        for _ in 0..pool.len() {
+            let mut guard = pool.acquire().await?;
+            guard.send_channel_data(&knock_frame).await?;
+            guard.release(&mut pool, true).await;
+        }
+        info!("Pre-Auth knock sent to server over {} streams", pool.len());
+
+        Ok(pool)
+    }
+
+    /// Establishes and fills a stream pool without touching credentials.
+    async fn try_establish_stream_pool(
+        &self,
+        stream_cfg: &StreamClientConfig,
+    ) -> Result<StreamPool, TunnelError> {
+        let mut pool = StreamPool::new(
+            stream_cfg.clone(),
+            crate::MIN_STREAMS,
+            crate::MAX_STREAMS_PER_HASH,
+        );
+        if pool.fill().await == 0 {
+            return Err(TunnelError::Turn(wdtt_turn::TurnError::Transport(
+                "stream pool could not establish any stream".into(),
+            )));
+        }
+        info!(
+            "Client established {} of {} stream allocations",
+            pool.len(),
+            pool.target_size()
+        );
+        Ok(pool)
+    }
+
     /// Run the client datapath until cancellation signal is received.
     pub async fn run(&mut self, cancel_rx: watch::Receiver<bool>) -> Result<(), TunnelError> {
         self.run_with_notify(cancel_rx, None).await
     }
+}
+
+/// Worker task managing a single client session on the server.
+///
+/// Session Affinity: All datagrams for this client session are processed strictly
+/// sequentially by this single async worker task, preventing any packet reordering
+/// across Tokio threads and eliminating spurious TCP SACK retransmits.
+pub struct SessionWorker {
+    /// Relayed client address on the TURN server.
+    pub relayed_peer: SocketAddr,
+    /// 16-byte unique session ID from knock.
+    pub session_id: [u8; 16],
+    /// WireGuard backend endpoint address.
+    pub wg_endpoint_addr: SocketAddr,
+    /// TURN relay server address.
+    pub turn_server_addr: SocketAddr,
+    /// Shared batched socket handle to TURN relay.
+    pub batched_turn: Arc<BatchedUdpSocket>,
+    /// Negotiated or allocated TURN channel number for this peer.
+    pub turn_channel_number: u16,
+    /// Server metrics collector handle.
+    pub metrics: Arc<TunnelMetrics>,
+    /// Optional transmit coalescing window duration.
+    pub coalesce_window: Option<Duration>,
+    /// Inbound frame queue from TURN dispatcher.
+    pub inbound_rx: mpsc::Receiver<BytesMut>,
+}
+
+impl SessionWorker {
+    /// Run the session worker datapath until cancelled.
+    pub async fn run(mut self, mut cancel_rx: watch::Receiver<bool>) -> Result<(), TunnelError> {
+        let wg_socket = Arc::new(bind_tuned_udp_socket("0.0.0.0:0".parse().unwrap())?);
+        let batched_wg = BatchedUdpSocket::new(wg_socket.clone());
+
+        const BATCH_SIZE: usize = 16;
+        let mut wg_batch_bufs: Vec<Vec<u8>> =
+            (0..BATCH_SIZE).map(|_| vec![0u8; MAX_PACKET_LEN]).collect();
+        let mut wg_batch_metas: Vec<RecvMeta> = vec![RecvMeta::default(); BATCH_SIZE];
+
+        let mut pending_turn_frames: Vec<BytesMut> = Vec::with_capacity(BATCH_SIZE);
+        let mut coalesce_turn_deadline: Option<tokio::time::Instant> = None;
+        let coalesce_turn_sleep = tokio::time::sleep(Duration::from_secs(3600));
+        tokio::pin!(coalesce_turn_sleep);
+
+        let mut pending_wg_frames: Vec<BytesMut> = Vec::with_capacity(BATCH_SIZE);
+        let mut coalesce_wg_deadline: Option<tokio::time::Instant> = None;
+        let coalesce_wg_sleep = tokio::time::sleep(Duration::from_secs(3600));
+        tokio::pin!(coalesce_wg_sleep);
+
+        let mut adaptive_coalescer = AdaptiveCoalescer::new(self.coalesce_window);
+        let mut seq_tx: u16 = 0;
+        let mut last_activity = Instant::now();
+        let mut inactivity_timer = interval(Duration::from_secs(10));
+
+        loop {
+            tokio::select! {
+                biased;
+
+                _ = cancel_rx.changed() => {
+                    if *cancel_rx.borrow() {
+                        trace!("SessionWorker for {} shutting down via cancel signal", self.relayed_peer);
+                        break;
+                    }
+                }
+
+                _ = inactivity_timer.tick() => {
+                    if last_activity.elapsed() >= DEFAULT_SESSION_TTL {
+                        info!("SessionWorker for {} timed out after {:?}", self.relayed_peer, DEFAULT_SESSION_TTL);
+                        break;
+                    }
+                }
+
+                () = &mut coalesce_turn_sleep, if coalesce_turn_deadline.is_some() => {
+                    if !pending_turn_frames.is_empty() {
+                        let pkts: Vec<TransmitPacket> = pending_turn_frames.iter().map(|b| TransmitPacket {
+                            buf: b,
+                            addr: self.turn_server_addr,
+                            gso_segment_size: None,
+                        }).collect();
+                        let _ = self.batched_turn.send_batch(&pkts).await;
+                        pending_turn_frames.clear();
+                    }
+                    coalesce_turn_deadline = None;
+                }
+
+                () = &mut coalesce_wg_sleep, if coalesce_wg_deadline.is_some() => {
+                    if !pending_wg_frames.is_empty() {
+                        let pkts: Vec<TransmitPacket> = pending_wg_frames.iter().map(|b| TransmitPacket {
+                            buf: b,
+                            addr: self.wg_endpoint_addr,
+                            gso_segment_size: None,
+                        }).collect();
+                        let _ = batched_wg.send_batch(&pkts).await;
+                        pending_wg_frames.clear();
+                    }
+                    coalesce_wg_deadline = None;
+                }
+
+                // Inbound frames from TURN dispatcher for this specific session
+                Some(payload) = self.inbound_rx.recv() => {
+                    last_activity = Instant::now();
+                    if let Ok((view, _)) = FrameView::decode(&payload) {
+                        let is_ctrl = is_control_frame(view.header.frame_type);
+                        match view.header.frame_type {
+                            FrameType::Data => {
+                                self.metrics.record_rx(view.payload.len());
+                                let mut b = BytesMut::new();
+                                b.extend_from_slice(view.payload);
+                                pending_wg_frames.push(b);
+                            }
+                            FrameType::Ping => {
+                                self.metrics.record_ping_rx();
+                                let echo_ts = PingPayload::decode(view.payload)
+                                    .map(|p| p.timestamp)
+                                    .unwrap_or(0);
+                                let now_ms = SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_millis() as u64;
+                                let pong = PongPayload {
+                                    echo_timestamp: echo_ts,
+                                    probe_id: view.header.seq,
+                                    receive_timestamp: now_ms,
+                                };
+                                let mut pbuf = [0u8; PongPayload::LEN];
+                                pong.encode(&mut pbuf);
+
+                                let mut resp_frame = BytesMut::new();
+                                encode_frame(
+                                    FrameType::Pong,
+                                    0,
+                                    0,
+                                    seq_tx,
+                                    &pbuf,
+                                    &mut resp_frame,
+                                );
+                                seq_tx = seq_tx.wrapping_add(1);
+
+                                let mut chan_buf = BytesMut::new();
+                                if encode_channel_data(self.turn_channel_number, &resp_frame, false, &mut chan_buf).is_ok() {
+                                    // Control frames bypass the coalescing buffer and flush immediately
+                                    let mut pkts: Vec<TransmitPacket> = pending_turn_frames.iter().map(|b| TransmitPacket {
+                                        buf: b,
+                                        addr: self.turn_server_addr,
+                                        gso_segment_size: None,
+                                    }).collect();
+                                    pkts.push(TransmitPacket {
+                                        buf: &chan_buf,
+                                        addr: self.turn_server_addr,
+                                        gso_segment_size: None,
+                                    });
+                                    let _ = self.batched_turn.send_batch(&pkts).await;
+                                    pending_turn_frames.clear();
+                                    coalesce_turn_deadline = None;
+                                }
+                            }
+                            _ => {}
+                        }
+
+                        // Flush or buffer WireGuard-bound frames
+                        if !pending_wg_frames.is_empty() {
+                            if is_ctrl || !adaptive_coalescer.is_coalescing_active() || pending_wg_frames.len() >= BATCH_SIZE {
+                                let pkts: Vec<TransmitPacket> = pending_wg_frames.iter().map(|b| TransmitPacket {
+                                    buf: b,
+                                    addr: self.wg_endpoint_addr,
+                                    gso_segment_size: None,
+                                }).collect();
+                                trace!("SessionWorker forwarding {} packets to WG endpoint {}", pkts.len(), self.wg_endpoint_addr);
+                                let _ = batched_wg.send_batch(&pkts).await;
+                                pending_wg_frames.clear();
+                                coalesce_wg_deadline = None;
+                            } else if coalesce_wg_deadline.is_none()
+                                && let Some(window) = adaptive_coalescer.window()
+                            {
+                                let d = tokio::time::Instant::now() + window;
+                                coalesce_wg_deadline = Some(d);
+                                coalesce_wg_sleep.as_mut().reset(d);
+                            }
+                        }
+                    }
+                }
+
+                // Packets from WireGuard backend -> send to client over TURN
+                wg_batch_res = batched_wg.recv_batch(&mut wg_batch_bufs, &mut wg_batch_metas) => {
+                    match wg_batch_res {
+                        Ok(count) => {
+                            self.metrics.record_batch_rx(count);
+                            adaptive_coalescer.on_wakeup_batch(count);
+                            trace!("SessionWorker received {} packets from WG backend", count);
+
+                            for i in 0..count {
+                                let meta = wg_batch_metas[i];
+                                let payload = &wg_batch_bufs[i][..meta.len];
+                                let mut frame = BytesMut::new();
+                                encode_frame(FrameType::Data, 0, 0, seq_tx, payload, &mut frame);
+                                seq_tx = seq_tx.wrapping_add(1);
+
+                                let mut chan_buf = BytesMut::new();
+                                if encode_channel_data(self.turn_channel_number, &frame, false, &mut chan_buf).is_ok() {
+                                    pending_turn_frames.push(chan_buf);
+                                    self.metrics.record_tx(meta.len);
+                                }
+                            }
+
+                            if !pending_turn_frames.is_empty() {
+                                if !adaptive_coalescer.is_coalescing_active() || pending_turn_frames.len() >= BATCH_SIZE {
+                                    let pkts: Vec<TransmitPacket> = pending_turn_frames.iter().map(|b| TransmitPacket {
+                                        buf: b,
+                                        addr: self.turn_server_addr,
+                                        gso_segment_size: None,
+                                    }).collect();
+                                    let _ = self.batched_turn.send_batch(&pkts).await;
+                                    pending_turn_frames.clear();
+                                    coalesce_turn_deadline = None;
+                                } else if coalesce_turn_deadline.is_none()
+                                    && let Some(window) = adaptive_coalescer.window()
+                                {
+                                    let d = tokio::time::Instant::now() + window;
+                                    coalesce_turn_deadline = Some(d);
+                                    coalesce_turn_sleep.as_mut().reset(d);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            trace!("WG recv error in SessionWorker: {e}");
+                        }
+                    }
+                }
+            }
+        }
+
+        // Flush any remaining buffered packets before exit
+        if !pending_turn_frames.is_empty() {
+            let pkts: Vec<TransmitPacket> = pending_turn_frames
+                .iter()
+                .map(|b| TransmitPacket {
+                    buf: b,
+                    addr: self.turn_server_addr,
+                    gso_segment_size: None,
+                })
+                .collect();
+            let _ = self.batched_turn.send_batch(&pkts).await;
+        }
+
+        Ok(())
+    }
+}
+
+/// Worker task managing a single client session in direct UDP / VK listen mode.
+pub struct DirectSessionWorker {
+    /// Shared current peer address (updated if client switches address or multi-streams).
+    pub relayed_peer: Arc<std::sync::RwLock<SocketAddr>>,
+    /// 16-byte session identifier from knock.
+    pub session_id: [u8; 16],
+    /// Local WireGuard endpoint (e.g. 127.0.0.1:51820).
+    pub wg_endpoint_addr: SocketAddr,
+    /// Shared batched UDP socket listening on the server's public UDP port.
+    pub batched_sock: Arc<BatchedUdpSocket>,
+    /// Server metrics collector.
+    pub metrics: Arc<TunnelMetrics>,
+    /// Optional transmit coalescing window duration.
+    pub coalesce_window: Option<Duration>,
+    /// Inbound frame queue from server dispatcher for this session.
+    pub inbound_rx: mpsc::Receiver<BytesMut>,
+}
+
+impl DirectSessionWorker {
+    /// Run the direct session worker datapath until cancelled.
+    pub async fn run(mut self, mut cancel_rx: watch::Receiver<bool>) -> Result<(), TunnelError> {
+        let wg_socket = Arc::new(bind_tuned_udp_socket("0.0.0.0:0".parse().unwrap())?);
+        let batched_wg = BatchedUdpSocket::new(wg_socket.clone());
+
+        const BATCH_SIZE: usize = 16;
+        let mut wg_batch_bufs: Vec<Vec<u8>> =
+            (0..BATCH_SIZE).map(|_| vec![0u8; MAX_PACKET_LEN]).collect();
+        let mut wg_batch_metas: Vec<RecvMeta> = vec![RecvMeta::default(); BATCH_SIZE];
+
+        let mut pending_client_frames: Vec<BytesMut> = Vec::with_capacity(BATCH_SIZE);
+        let mut coalesce_client_deadline: Option<tokio::time::Instant> = None;
+        let coalesce_client_sleep = tokio::time::sleep(Duration::from_secs(3600));
+        tokio::pin!(coalesce_client_sleep);
+
+        let mut pending_wg_frames: Vec<BytesMut> = Vec::with_capacity(BATCH_SIZE);
+        let mut coalesce_wg_deadline: Option<tokio::time::Instant> = None;
+        let coalesce_wg_sleep = tokio::time::sleep(Duration::from_secs(3600));
+        tokio::pin!(coalesce_wg_sleep);
+
+        let mut adaptive_coalescer = AdaptiveCoalescer::new(self.coalesce_window);
+        let mut seq_tx: u16 = 0;
+        let mut last_activity = Instant::now();
+        let mut inactivity_timer = interval(Duration::from_secs(10));
+
+        loop {
+            tokio::select! {
+                biased;
+
+                _ = cancel_rx.changed() => {
+                    if *cancel_rx.borrow() {
+                        trace!("DirectSessionWorker {:?} shutting down via cancel signal", &self.session_id[..4]);
+                        break;
+                    }
+                }
+
+                _ = inactivity_timer.tick() => {
+                    if last_activity.elapsed() >= DEFAULT_SESSION_TTL {
+                        info!("DirectSessionWorker {:?} timed out after {:?}", &self.session_id[..4], DEFAULT_SESSION_TTL);
+                        break;
+                    }
+                }
+
+                () = &mut coalesce_client_sleep, if coalesce_client_deadline.is_some() => {
+                    if !pending_client_frames.is_empty() {
+                        let peer = *self.relayed_peer.read().unwrap();
+                        let pkts: Vec<TransmitPacket> = pending_client_frames.iter().map(|b| TransmitPacket {
+                            buf: b,
+                            addr: peer,
+                            gso_segment_size: None,
+                        }).collect();
+                        let _ = self.batched_sock.send_batch(&pkts).await;
+                        pending_client_frames.clear();
+                    }
+                    coalesce_client_deadline = None;
+                }
+
+                () = &mut coalesce_wg_sleep, if coalesce_wg_deadline.is_some() => {
+                    if !pending_wg_frames.is_empty() {
+                        let pkts: Vec<TransmitPacket> = pending_wg_frames.iter().map(|b| TransmitPacket {
+                            buf: b,
+                            addr: self.wg_endpoint_addr,
+                            gso_segment_size: None,
+                        }).collect();
+                        let _ = batched_wg.send_batch(&pkts).await;
+                        pending_wg_frames.clear();
+                    }
+                    coalesce_wg_deadline = None;
+                }
+
+                // Inbound frames from dispatcher for this session
+                Some(payload) = self.inbound_rx.recv() => {
+                    last_activity = Instant::now();
+                    if let Ok((view, _)) = FrameView::decode(&payload) {
+                        let is_ctrl = is_control_frame(view.header.frame_type);
+                        match view.header.frame_type {
+                            FrameType::Data => {
+                                self.metrics.record_rx(view.payload.len());
+                                let mut b = BytesMut::new();
+                                b.extend_from_slice(view.payload);
+                                pending_wg_frames.push(b);
+                            }
+                            FrameType::Ping => {
+                                self.metrics.record_ping_rx();
+                                let echo_ts = PingPayload::decode(view.payload)
+                                    .map(|p| p.timestamp)
+                                    .unwrap_or(0);
+                                let now_ms = SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_millis() as u64;
+                                let pong = PongPayload {
+                                    echo_timestamp: echo_ts,
+                                    probe_id: view.header.seq,
+                                    receive_timestamp: now_ms,
+                                };
+                                let mut pbuf = [0u8; PongPayload::LEN];
+                                pong.encode(&mut pbuf);
+                                let mut pong_frame = BytesMut::new();
+                                encode_frame(
+                                    FrameType::Pong,
+                                    0,
+                                    0,
+                                    seq_tx,
+                                    &pbuf,
+                                    &mut pong_frame,
+                                );
+                                seq_tx = seq_tx.wrapping_add(1);
+                                let peer = *self.relayed_peer.read().unwrap();
+                                let pkt = TransmitPacket {
+                                    buf: &pong_frame,
+                                    addr: peer,
+                                    gso_segment_size: None,
+                                };
+                                let _ = self.batched_sock.send_batch(&[pkt]).await;
+                                self.metrics.record_ping_tx();
+                            }
+                            FrameType::Pong => {
+                                self.metrics.record_ping_rx();
+                            }
+                            _ => {}
+                        }
+
+                        // Flush or coalesce to WG
+                        if !pending_wg_frames.is_empty() {
+                            let should_flush = is_ctrl || !adaptive_coalescer.is_coalescing_active() || pending_wg_frames.len() >= BATCH_SIZE;
+                            if should_flush {
+                                let pkts: Vec<TransmitPacket> = pending_wg_frames.iter().map(|b| TransmitPacket {
+                                    buf: b,
+                                    addr: self.wg_endpoint_addr,
+                                    gso_segment_size: None,
+                                }).collect();
+                                let _ = batched_wg.send_batch(&pkts).await;
+                                pending_wg_frames.clear();
+                                coalesce_wg_deadline = None;
+                            } else if coalesce_wg_deadline.is_none()
+                                && let Some(window) = adaptive_coalescer.window()
+                            {
+                                let d = tokio::time::Instant::now() + window;
+                                coalesce_wg_deadline = Some(d);
+                                coalesce_wg_sleep.as_mut().reset(d);
+                            }
+                        }
+                    }
+                }
+
+                // Inbound frames from WireGuard backend
+                wg_batch_res = batched_wg.recv_batch(&mut wg_batch_bufs, &mut wg_batch_metas) => {
+                    match wg_batch_res {
+                        Ok(count) => {
+                            last_activity = Instant::now();
+                            adaptive_coalescer.on_wakeup_batch(count);
+                            for i in 0..count {
+                                let meta = wg_batch_metas[i];
+                                let slice = &wg_batch_bufs[i][..meta.len];
+                                let is_ctrl = inspect_wg_packet(slice)
+                                    .map(|h| h.is_handshake())
+                                    .unwrap_or(false);
+
+                                let mut frame = BytesMut::new();
+                                encode_frame(
+                                    FrameType::Data,
+                                    0,
+                                    0,
+                                    seq_tx,
+                                    slice,
+                                    &mut frame,
+                                );
+                                seq_tx = seq_tx.wrapping_add(1);
+                                self.metrics.record_tx(meta.len);
+
+                                if is_ctrl {
+                                    let peer = *self.relayed_peer.read().unwrap();
+                                    let pkt = TransmitPacket {
+                                        buf: &frame,
+                                        addr: peer,
+                                        gso_segment_size: None,
+                                    };
+                                    let _ = self.batched_sock.send_batch(&[pkt]).await;
+                                } else {
+                                    pending_client_frames.push(frame);
+                                }
+                            }
+
+                            if !pending_client_frames.is_empty() {
+                                let should_flush = !adaptive_coalescer.is_coalescing_active() || pending_client_frames.len() >= BATCH_SIZE;
+                                if should_flush {
+                                    let peer = *self.relayed_peer.read().unwrap();
+                                    let pkts: Vec<TransmitPacket> = pending_client_frames.iter().map(|b| TransmitPacket {
+                                        buf: b,
+                                        addr: peer,
+                                        gso_segment_size: None,
+                                    }).collect();
+                                    let _ = self.batched_sock.send_batch(&pkts).await;
+                                    pending_client_frames.clear();
+                                    coalesce_client_deadline = None;
+                                } else if coalesce_client_deadline.is_none()
+                                    && let Some(window) = adaptive_coalescer.window()
+                                {
+                                    let d = tokio::time::Instant::now() + window;
+                                    coalesce_client_deadline = Some(d);
+                                    coalesce_client_sleep.as_mut().reset(d);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            trace!("WG recv error in DirectSessionWorker: {e}");
+                        }
+                    }
+                }
+            }
+        }
+
+        // Flush any remaining buffered packets before exit
+        if !pending_client_frames.is_empty() {
+            let peer = *self.relayed_peer.read().unwrap();
+            let pkts: Vec<TransmitPacket> = pending_client_frames
+                .iter()
+                .map(|b| TransmitPacket {
+                    buf: b,
+                    addr: peer,
+                    gso_segment_size: None,
+                })
+                .collect();
+            let _ = self.batched_sock.send_batch(&pkts).await;
+        }
+
+        Ok(())
+    }
+}
+
+/// Per-session worker for stream (TCP/TLS) mode: relays ChannelData payloads
+/// between the stream connection and the WireGuard UDP endpoint.
+pub struct StreamSessionWorker {
+    /// 16-byte unique session ID from knock.
+    pub session_id: [u8; 16],
+    /// WireGuard backend endpoint address.
+    pub wg_endpoint_addr: SocketAddr,
+    /// Outbound queue of the owning stream connection (pre-framed ChannelData).
+    pub tx: mpsc::Sender<Bytes>,
+    /// Server metrics collector handle.
+    pub metrics: Arc<TunnelMetrics>,
+    /// Optional transmit coalescing window duration.
+    pub coalesce_window: Option<Duration>,
+    /// Inbound frame queue from the stream dispatcher.
+    pub inbound_rx: mpsc::Receiver<BytesMut>,
+}
+
+impl StreamSessionWorker {
+    /// Run the stream session worker datapath until cancelled.
+    pub async fn run(mut self, mut cancel_rx: watch::Receiver<bool>) -> Result<(), TunnelError> {
+        let wg_socket = Arc::new(bind_tuned_udp_socket("0.0.0.0:0".parse().unwrap())?);
+        let batched_wg = BatchedUdpSocket::new(wg_socket.clone());
+
+        const BATCH_SIZE: usize = 16;
+        let mut wg_batch_bufs: Vec<Vec<u8>> =
+            (0..BATCH_SIZE).map(|_| vec![0u8; MAX_PACKET_LEN]).collect();
+        let mut wg_batch_metas: Vec<RecvMeta> = vec![RecvMeta::default(); BATCH_SIZE];
+
+        let mut pending_wg_frames: Vec<BytesMut> = Vec::with_capacity(BATCH_SIZE);
+        let mut coalesce_wg_sleep = Box::pin(tokio::time::sleep(Duration::from_secs(3600)));
+        let mut coalesce_wg_deadline: Option<tokio::time::Instant> = None;
+
+        let mut adaptive_coalescer = AdaptiveCoalescer::new(self.coalesce_window);
+        let mut seq_tx: u16 = 0;
+        let mut last_activity = Instant::now();
+        let mut inactivity_timer = interval(Duration::from_secs(10));
+
+        loop {
+            tokio::select! {
+                biased;
+
+                _ = cancel_rx.changed() => {
+                    if *cancel_rx.borrow() {
+                        break;
+                    }
+                }
+
+                _ = inactivity_timer.tick() => {
+                    if last_activity.elapsed() > DEFAULT_SESSION_TTL {
+                        debug!(
+                            "Stream session {:02X?} idle timeout",
+                            &self.session_id[..4]
+                        );
+                        break;
+                    }
+                }
+
+                _ = &mut coalesce_wg_sleep, if coalesce_wg_deadline.is_some() => {
+                    coalesce_wg_deadline = None;
+                    if !pending_wg_frames.is_empty() {
+                        let pkts: Vec<TransmitPacket> = pending_wg_frames
+                            .iter()
+                            .map(|b| TransmitPacket {
+                                buf: b,
+                                addr: self.wg_endpoint_addr,
+                                gso_segment_size: None,
+                            })
+                            .collect();
+                        if let Err(e) = batched_wg.send_batch(&pkts).await {
+                            warn!("Stream worker WG send error: {e}");
+                        }
+                        pending_wg_frames.clear();
+                    }
+                }
+
+                inbound = self.inbound_rx.recv() => {
+                    let frame = match inbound {
+                        Some(f) => f,
+                        None => break,
+                    };
+                    last_activity = Instant::now();
+
+                    let (view, _) = match FrameView::decode(&frame) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            debug!("Stream worker invalid frame: {e}");
+                            continue;
+                        }
+                    };
+                    let is_ctrl = is_control_frame(view.header.frame_type);
+
+                    match view.header.frame_type {
+                        FrameType::Data => {
+                            self.metrics.record_rx(view.payload.len());
+                            pending_wg_frames.push(BytesMut::from(view.payload));
+                        }
+                        FrameType::Ping => {
+                            self.metrics.record_ping_rx();
+                            let echo_ts = PingPayload::decode(view.payload)
+                                .map(|p| p.timestamp)
+                                .unwrap_or(0);
+                            let now_ms = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis() as u64;
+                            let pong = PongPayload {
+                                echo_timestamp: echo_ts,
+                                probe_id: view.header.seq,
+                                receive_timestamp: now_ms,
+                            };
+                            let mut pbuf = [0u8; PongPayload::LEN];
+                            pong.encode(&mut pbuf);
+                            let mut resp_frame = BytesMut::new();
+                            encode_frame(FrameType::Pong, 0, 0, seq_tx, &pbuf, &mut resp_frame);
+                            seq_tx = seq_tx.wrapping_add(1);
+                            let mut chan_buf = BytesMut::new();
+                            encode_tcp_channel_data(0x4000, &resp_frame, &mut chan_buf);
+                            let _ = self.tx.send(chan_buf.freeze()).await;
+                        }
+                        FrameType::Pong => {
+                            self.metrics.record_ping_rx();
+                        }
+                        _ => {}
+                    }
+
+                    if is_ctrl
+                        || !adaptive_coalescer.is_coalescing_active()
+                        || pending_wg_frames.len() >= BATCH_SIZE
+                    {
+                        if !pending_wg_frames.is_empty() {
+                            let pkts: Vec<TransmitPacket> = pending_wg_frames
+                                .iter()
+                                .map(|b| TransmitPacket {
+                                    buf: b,
+                                    addr: self.wg_endpoint_addr,
+                                    gso_segment_size: None,
+                                })
+                                .collect();
+                            if let Err(e) = batched_wg.send_batch(&pkts).await {
+                                warn!("Stream worker WG send error: {e}");
+                            }
+                            pending_wg_frames.clear();
+                        }
+                        coalesce_wg_deadline = None;
+                    } else if coalesce_wg_deadline.is_none()
+                        && let Some(window) = adaptive_coalescer.window()
+                    {
+                        let deadline = tokio::time::Instant::now() + window;
+                        coalesce_wg_sleep.as_mut().reset(deadline);
+                        coalesce_wg_deadline = Some(deadline);
+                    }
+                }
+
+                wg_res = batched_wg.recv_batch(&mut wg_batch_bufs, &mut wg_batch_metas) => {
+                    let count = match wg_res {
+                        Ok(c) => c,
+                        Err(e) => {
+                            trace!("Stream worker WG recv error: {e}");
+                            continue;
+                        }
+                    };
+                    self.metrics.record_batch_rx(count);
+                    adaptive_coalescer.on_wakeup_batch(count);
+                    last_activity = Instant::now();
+
+                    for i in 0..count {
+                        let meta = wg_batch_metas[i];
+                        let slice = &wg_batch_bufs[i][..meta.len];
+                        let mut frame = BytesMut::new();
+                        encode_frame(FrameType::Data, 0, 0, seq_tx, slice, &mut frame);
+                        seq_tx = seq_tx.wrapping_add(1);
+                        let mut chan_buf = BytesMut::new();
+                        encode_tcp_channel_data(0x4000, &frame, &mut chan_buf);
+                        self.metrics.record_tx(meta.len);
+                        if self.tx.send(chan_buf.freeze()).await.is_err() {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// One live tunnel session as seen by the stream connection tasks.
+///
+/// The `sender` feeds the session's worker with inbound frames; `tx` is the
+/// outbound queue of the connection that most recently carried a knock for this
+/// session, so replies follow the client to whichever pooled stream it is
+/// currently reading from.
+struct StreamSessionEntry {
+    sender: mpsc::Sender<BytesMut>,
+    tx: mpsc::Sender<Bytes>,
+}
+
+/// Serve one accepted TURN stream connection for its whole lifetime.
+///
+/// The connection first has to prove itself with a pre-auth knock; after that
+/// every `Data` frame it carries is dispatched to the session worker of the
+/// session id the knock announced. Because a client pool opens several streams
+/// that share one session id, the worker is keyed by session id in a map shared
+/// with every other connection task, and each new knock re-points that
+/// session's outbound channel at the connection that sent it. That way the
+/// client can read the session's replies from whichever pooled stream it
+/// currently has checked out.
+///
+/// `sessions` maps session id -> session entry and is shared across all
+/// connection tasks.
+#[allow(clippy::too_many_arguments)]
+async fn serve_stream_connection(
+    handle: StreamConnectionHandle,
+    peer: SocketAddr,
+    auth: Arc<std::sync::Mutex<KnockAuthenticator>>,
+    sessions: Arc<std::sync::Mutex<HashMap<[u8; 16], StreamSessionEntry>>>,
+    wg_endpoint_addr: SocketAddr,
+    metrics: Arc<TunnelMetrics>,
+    coalesce_window: Option<Duration>,
+    cancel_rx: &mut watch::Receiver<bool>,
+) {
+    let mut handle = handle;
+    let mut session_id: Option<[u8; 16]> = None;
+
+    loop {
+        tokio::select! {
+            biased;
+
+            _ = cancel_rx.changed() => {
+                if *cancel_rx.borrow() {
+                    break;
+                }
+            }
+
+            ctl = handle.control_rx.recv() => {
+                match ctl {
+                    Some(resp) => {
+                        if handle.tx.send(resp).await.is_err() {
+                            break;
+                        }
+                    }
+                    None => break,
+                }
+            }
+
+            inbound = handle.rx.recv() => {
+                let payload = match inbound {
+                    Some(p) => p,
+                    None => break,
+                };
+
+                if let Ok((view, _)) = FrameView::decode(&payload)
+                    && view.header.frame_type == FrameType::HandshakeInit
+                {
+                    let now_sec = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    let verified = {
+                        // The replay cache inside the authenticator is shared
+                        // across every connection, so a knock cannot be
+                        // replayed on a second stream.
+                        let mut auth = auth.lock().expect("knock authenticator poisoned");
+                        auth.verify_knock_packet(now_sec, view.payload)
+                    };
+                    match verified {
+                        Ok(knock_payload) => {
+                            let sid = knock_payload.session_id;
+                            info!(
+                                "Pre-Auth Knock verified over stream for peer {peer} (session {:02X?})",
+                                &sid[..4]
+                            );
+
+                            // Create the session (and its worker) only on the
+                            // first knock for this id. A later knock on another
+                            // pooled stream only re-points the outbound channel.
+                            let mut spawn_worker = false;
+                            let mut worker_rx = None;
+                            {
+                                let mut map = sessions.lock().expect("session map poisoned");
+                                match map.get_mut(&sid) {
+                                    Some(entry) if !entry.sender.is_closed() => {
+                                        // Re-point the session at this
+                                        // connection: the client may have moved
+                                        // to a different pooled stream.
+                                        entry.tx = handle.tx.clone();
+                                    }
+                                    _ => {
+                                        let (session_tx, session_rx) = mpsc::channel(2048);
+                                        map.insert(
+                                            sid,
+                                            StreamSessionEntry {
+                                                sender: session_tx,
+                                                tx: handle.tx.clone(),
+                                            },
+                                        );
+                                        worker_rx = Some(session_rx);
+                                        spawn_worker = true;
+                                    }
+                                }
+                            }
+
+                            if spawn_worker {
+                                let worker = StreamSessionWorker {
+                                    session_id: sid,
+                                    wg_endpoint_addr,
+                                    tx: handle.tx.clone(),
+                                    metrics: metrics.clone(),
+                                    coalesce_window,
+                                    inbound_rx: worker_rx.expect("receiver created with the session"),
+                                };
+                                let worker_cancel = cancel_rx.clone();
+                                tokio::spawn(async move {
+                                    if let Err(e) = worker.run(worker_cancel).await {
+                                        warn!("StreamSessionWorker terminated: {e}");
+                                    }
+                                });
+                            }
+
+                            session_id = Some(sid);
+
+                            let mut resp_frame = BytesMut::new();
+                            encode_frame(
+                                FrameType::HandshakeResp,
+                                0,
+                                0,
+                                0,
+                                b"WDTT2-OK",
+                                &mut resp_frame,
+                            );
+                            let mut framed = BytesMut::new();
+                            encode_tcp_channel_data(0x4000, &resp_frame, &mut framed);
+                            if handle.tx.send(framed.freeze()).await.is_err() {
+                                break;
+                            }
+                            continue;
+                        }
+                        Err(e) => {
+                            debug!("Invalid knock over stream from {peer}: {e}");
+                            continue;
+                        }
+                    }
+                }
+
+                let sid = match session_id {
+                    Some(s) => s,
+                    None => {
+                        trace!("Unauthenticated stream payload from {peer} dropped");
+                        continue;
+                    }
+                };
+                let sender = {
+                    let map = sessions.lock().expect("session map poisoned");
+                    map.get(&sid).map(|e| e.sender.clone())
+                };
+                if let Some(sender) = sender {
+                    let mut b = BytesMut::new();
+                    b.extend_from_slice(&payload);
+                    if let Err(e) = sender.try_send(b) {
+                        warn!("Dispatch to stream session queue full: {e}");
+                    }
+                }
+            }
+        }
+    }
+
+    // The connection may be the session's current outbound path. If so, drop
+    // the session so a fresh knock on another stream can rebuild it rather than
+    // leaving the worker writing into a closed channel.
+    if let Some(sid) = session_id {
+        let mut map = sessions.lock().expect("session map poisoned");
+        if let Some(entry) = map.get(&sid)
+            && entry.tx.same_channel(&handle.tx)
+        {
+            map.remove(&sid);
+        }
+    }
+    debug!("Stream TURN connection from {peer} closed");
 }
 
 /// Server tunnel session terminating TURN relay and forwarding to WireGuard endpoint.
@@ -420,13 +2609,22 @@ impl TunnelServer {
         mut cancel_rx: watch::Receiver<bool>,
         on_allocated: Option<tokio::sync::oneshot::Sender<SocketAddr>>,
     ) -> Result<(), TunnelError> {
+        if let Some(listen_addr) = self.config.direct_listen_addr {
+            return self
+                .run_direct_with_notify(listen_addr, cancel_rx, on_allocated)
+                .await;
+        }
+
+        if let Some(listen_addr) = self.config.stream_listen_addr {
+            return self
+                .run_stream_server_with_notify(listen_addr, cancel_rx, on_allocated)
+                .await;
+        }
+
         info!(
-            "Starting TunnelServer: connecting to TURN {} forwarding to WG {}",
+            "Starting TunnelServer (TURN mode): connecting to TURN {} forwarding to WG {}",
             self.config.turn_server_addr, self.config.wg_endpoint_addr
         );
-
-        let wg_socket = Arc::new(bind_tuned_udp_socket("0.0.0.0:0".parse().unwrap())?);
-        info!("Server WG forwarder bound to {}", wg_socket.local_addr()?);
 
         let turn_cfg = TurnClientConfig {
             server_addr: self.config.turn_server_addr,
@@ -453,30 +2651,39 @@ impl TunnelServer {
         }
 
         // Derive dynamic refresh intervals from negotiated TURN LIFETIME
-        let mut alloc_refresh_timer = interval(turn_client.allocation_refresh_interval());
-        let mut perm_refresh_timer = interval(turn_client.permission_refresh_interval());
-        let mut chan_bind_refresh_timer = interval(turn_client.channel_bind_refresh_interval());
+        let mut alloc_refresh_timer = tokio::time::interval_at(
+            tokio::time::Instant::now() + turn_client.allocation_refresh_interval(),
+            turn_client.allocation_refresh_interval(),
+        );
+        let mut perm_refresh_timer = tokio::time::interval_at(
+            tokio::time::Instant::now() + turn_client.permission_refresh_interval(),
+            turn_client.permission_refresh_interval(),
+        );
+        let mut chan_bind_refresh_timer = tokio::time::interval_at(
+            tokio::time::Instant::now() + turn_client.channel_bind_refresh_interval(),
+            turn_client.channel_bind_refresh_interval(),
+        );
 
-        let batched_wg = BatchedUdpSocket::new(wg_socket.clone());
-        let batched_turn = BatchedUdpSocket::new(turn_client.socket().clone());
+        let batched_turn = Arc::new(BatchedUdpSocket::new(turn_client.socket().clone()));
 
         let knock_key = derive_pre_auth_knock_key(&Psk::from_bytes(self.config.psk));
         let mut auth = KnockAuthenticator::new(knock_key, DEFAULT_MAX_CLOCK_SKEW_SEC);
 
-        let mut active_session: Option<AuthorizedClientSession> = None;
-        let mut seq_tx: u16 = 0;
+        let mut active_sessions: HashMap<[u8; 16], mpsc::Sender<BytesMut>> = HashMap::new();
+        let mut endpoint_to_session: HashMap<SocketAddr, [u8; 16]> = HashMap::new();
+        let mut channel_to_peer: HashMap<u16, SocketAddr> = HashMap::new();
+        let mut peer_to_channel: HashMap<SocketAddr, u16> = HashMap::new();
+        let mut next_channel_number: u16 = 0x4000;
 
         const BATCH_SIZE: usize = 16;
-        let mut wg_batch_bufs: Vec<Vec<u8>> =
-            (0..BATCH_SIZE).map(|_| vec![0u8; MAX_PACKET_LEN]).collect();
-        let mut wg_batch_metas: Vec<RecvMeta> = vec![RecvMeta::default(); BATCH_SIZE];
-
         let mut turn_batch_bufs: Vec<Vec<u8>> =
             (0..BATCH_SIZE).map(|_| vec![0u8; MAX_PACKET_LEN]).collect();
         let mut turn_batch_metas: Vec<RecvMeta> = vec![RecvMeta::default(); BATCH_SIZE];
 
         loop {
             tokio::select! {
+                biased;
+
                 _ = cancel_rx.changed() => {
                     if *cancel_rx.borrow() {
                         info!("TunnelServer shutting down via cancel signal");
@@ -493,7 +2700,7 @@ impl TunnelServer {
                 }
 
                 _ = perm_refresh_timer.tick() => {
-                    if active_session.is_some() {
+                    if !active_sessions.is_empty() {
                         trace!("TunnelServer dynamically refreshing TURN permission");
                         if let Err(e) = turn_client.refresh_permission().await {
                             warn!("Failed to refresh TURN permission: {e}");
@@ -502,7 +2709,7 @@ impl TunnelServer {
                 }
 
                 _ = chan_bind_refresh_timer.tick() => {
-                    if active_session.is_some() {
+                    if !active_sessions.is_empty() {
                         trace!("TunnelServer dynamically refreshing TURN channel bind");
                         if let Err(e) = turn_client.refresh_channel_bind().await {
                             warn!("Failed to refresh TURN channel bind: {e}");
@@ -510,20 +2717,21 @@ impl TunnelServer {
                     }
                 }
 
-                // Packets from TURN relay -> validate knock or forward to WireGuard (batched)
+                // Packets from TURN relay -> validate knock or dispatch to session worker (batched)
                 turn_batch_res = batched_turn.recv_batch(&mut turn_batch_bufs, &mut turn_batch_metas) => {
                     match turn_batch_res {
                         Ok(count) => {
+                            self.metrics.record_batch_rx(count);
                             for i in 0..count {
                                 let meta = turn_batch_metas[i];
                                 let slice = &turn_batch_bufs[i][..meta.len];
                                 if let Ok(Some(turn_msg)) = turn_client.parse_incoming(slice, meta.addr) {
                                     let (peer_from_turn, payload) = match turn_msg {
                                         TurnIncoming::DataIndication { peer_addr, payload } => (Some(peer_addr), payload),
-                                        TurnIncoming::ChannelData { payload, .. } => (
-                                            active_session.as_ref().map(|s| s.relayed_addr),
-                                            payload,
-                                        ),
+                                        TurnIncoming::ChannelData { channel, payload } => {
+                                            let peer = channel_to_peer.get(&channel).copied();
+                                            (peer, payload)
+                                        }
                                         _ => (None, bytes::Bytes::new()),
                                     };
 
@@ -531,51 +2739,64 @@ impl TunnelServer {
                                         continue;
                                     }
 
-                                    let now = Instant::now();
-
-                                    // 1. Session expiration check
-                                    if let Some(ref session) = active_session
-                                        && session.is_expired(now)
-                                    {
-                                        info!(
-                                            "Client session {} expired due to inactivity (TTL {:?})",
-                                            session.relayed_addr, session.session_ttl
-                                        );
-                                        active_session = None;
-                                    }
-
-                                    // 2. Check for Pre-Auth Knock (HandshakeInit)
+                                    // 1. Check for Pre-Auth Knock (HandshakeInit)
                                     if let Ok((view, _)) = FrameView::decode(&payload)
                                         && view.header.frame_type == FrameType::HandshakeInit
                                     {
                                         let now_sec = SystemTime::now()
                                             .duration_since(UNIX_EPOCH)
-                                            .unwrap()
+                                            .unwrap_or_default()
                                             .as_secs();
 
                                         match auth.verify_knock_packet(now_sec, view.payload) {
                                             Ok(knock_payload) => {
-                                                let client_peer = peer_from_turn
-                                                    .or_else(|| active_session.as_ref().map(|s| s.relayed_addr));
-
-                                                if let Some(peer) = client_peer {
+                                                if let Some(peer) = peer_from_turn {
+                                                    let session_id = knock_payload.session_id;
                                                     info!(
                                                         "Pre-Auth Knock verified for peer {} (session {:?})!",
-                                                        peer, knock_payload.session_id
+                                                        peer, session_id
                                                     );
 
-                                                    // Re-bind peer on TURN
-                                                    if let Err(e) = turn_client.bind_peer(peer).await {
-                                                        warn!("Failed to bind peer {peer} on TURN: {e}");
+                                                    let assigned_channel = if let Some(chan) = peer_to_channel.get(&peer) {
+                                                        *chan
+                                                    } else {
+                                                        let chan = next_channel_number;
+                                                        next_channel_number = next_channel_number.saturating_add(1);
+                                                        peer_to_channel.insert(peer, chan);
+                                                        channel_to_peer.insert(chan, peer);
+                                                        chan
+                                                    };
+
+                                                    // Re-bind peer on TURN with dedicated channel
+                                                    if let Err(e) = turn_client.bind_peer_channel(peer, assigned_channel).await {
+                                                        warn!("Failed to bind peer {peer} on TURN channel 0x{assigned_channel:04X}: {e}");
                                                     }
 
-                                                    active_session = Some(AuthorizedClientSession {
-                                                        relayed_addr: peer,
-                                                        session_id: knock_payload.session_id,
-                                                        authorized_at: now,
-                                                        last_activity: now,
-                                                        session_ttl: DEFAULT_SESSION_TTL,
-                                                    });
+                                                    endpoint_to_session.insert(peer, session_id);
+                                                    let is_new = !active_sessions.contains_key(&session_id)
+                                                        || active_sessions.get(&session_id).unwrap().is_closed();
+
+                                                    if is_new {
+                                                        let (session_tx, session_rx) = mpsc::channel(2048);
+                                                        let worker = SessionWorker {
+                                                            relayed_peer: peer,
+                                                            session_id,
+                                                            wg_endpoint_addr: self.config.wg_endpoint_addr,
+                                                            turn_server_addr: self.config.turn_server_addr,
+                                                            batched_turn: batched_turn.clone(),
+                                                            turn_channel_number: assigned_channel,
+                                                            metrics: self.metrics.clone(),
+                                                            coalesce_window: self.config.coalesce_window,
+                                                            inbound_rx: session_rx,
+                                                        };
+                                                        let worker_cancel = cancel_rx.clone();
+                                                        tokio::spawn(async move {
+                                                            if let Err(e) = worker.run(worker_cancel).await {
+                                                                warn!("SessionWorker terminated with error: {e}");
+                                                            }
+                                                        });
+                                                        active_sessions.insert(session_id, session_tx);
+                                                    }
 
                                                     // Send HandshakeResp
                                                     let mut resp_frame = BytesMut::new();
@@ -587,7 +2808,7 @@ impl TunnelServer {
                                                         b"WDTT2-OK",
                                                         &mut resp_frame,
                                                     );
-                                                    let _ = turn_client.send_channel_data(&resp_frame).await;
+                                                    let _ = turn_client.send_channel_data_to(assigned_channel, &resp_frame).await;
                                                 } else {
                                                     debug!("Knock verified but peer address unknown; silent discard");
                                                 }
@@ -599,59 +2820,286 @@ impl TunnelServer {
                                         continue;
                                     }
 
-                                    // 3. Authenticated Data forwarding
-                                    if let Some(ref mut session) = active_session {
-                                        if let Some(peer) = peer_from_turn
-                                            && peer != session.relayed_addr
-                                        {
-                                            debug!(
-                                                "Packet from unauthorized peer {peer} silently dropped; expected {}",
-                                                session.relayed_addr
-                                            );
-                                            continue;
+                                    // 2. Dispatch data/control datagram to session worker by session_id
+                                    if let Some(peer) = peer_from_turn {
+                                        if let Some(session_id) = endpoint_to_session.get(&peer) {
+                                            if let Some(tx) = active_sessions.get(session_id) {
+                                                trace!("TunnelServer dispatching {} bytes to worker for session {:?}", payload.len(), session_id);
+                                                let mut b = BytesMut::new();
+                                                b.extend_from_slice(&payload);
+                                                if let Err(e) = tx.try_send(b) {
+                                                    warn!("Failed to dispatch to session worker for {peer}: {e}");
+                                                }
+                                            }
+                                        } else {
+                                            trace!("Unauthenticated data packet for {peer} dropped silently");
                                         }
-
-                                        if let Ok((view, _)) = FrameView::decode(&payload)
-                                            && view.header.frame_type == FrameType::Data
-                                        {
-                                            session.last_activity = now;
-                                            self.metrics.record_rx(view.payload.len());
-                                            let _ = wg_socket
-                                                .send_to(view.payload, self.config.wg_endpoint_addr)
-                                                .await;
-                                        }
-                                    } else {
-                                        debug!("Unauthenticated data packet dropped silently");
                                     }
                                 }
                             }
+
+                            // Prune closed session channels
+                            active_sessions.retain(|_, tx| !tx.is_closed());
+                            endpoint_to_session.retain(|_, id| active_sessions.contains_key(id));
                         }
                         Err(e) => {
                             trace!("TURN incoming batch error: {e}");
                         }
                     }
                 }
+            }
+        }
 
-                // Packets from WireGuard endpoint -> send over TURN to client (batched)
-                wg_batch_res = batched_wg.recv_batch(&mut wg_batch_bufs, &mut wg_batch_metas), if active_session.is_some() => {
-                    match wg_batch_res {
+        Ok(())
+    }
+
+    /// Run the server in stream (TCP/TLS) mode: accept TURN stream connections,
+    /// verify the pre-auth knock, and relay ChannelData to the WireGuard endpoint.
+    async fn run_stream_server_with_notify(
+        &mut self,
+        listen_addr: SocketAddr,
+        mut cancel_rx: watch::Receiver<bool>,
+        on_allocated: Option<tokio::sync::oneshot::Sender<SocketAddr>>,
+    ) -> Result<(), TunnelError> {
+        info!(
+            "Starting TunnelServer in stream mode: listening on {listen_addr}, forwarding to WG {}",
+            self.config.wg_endpoint_addr
+        );
+
+        let server_cfg = StreamServerConfig {
+            listen_addr,
+            username: self.config.turn_username.clone(),
+            password: self.config.turn_password.clone(),
+            realm: self.config.turn_realm.clone(),
+            channel_number: 0x4000,
+            lifetime_sec: 600,
+            tls_cert_der: self.config.tls_cert_der.clone(),
+            tls_key_der: self.config.tls_key_der.clone(),
+        };
+        let server = StreamTurnServer::bind(server_cfg).await?;
+        let bound = server.local_addr()?;
+        self.relayed_addr = Some(bound);
+        if let Some(tx) = on_allocated {
+            let _ = tx.send(bound);
+        }
+
+        let knock_key = derive_pre_auth_knock_key(&Psk::from_bytes(self.config.psk));
+        let auth: Arc<std::sync::Mutex<KnockAuthenticator>> = Arc::new(std::sync::Mutex::new(
+            KnockAuthenticator::new(knock_key, DEFAULT_MAX_CLOCK_SKEW_SEC),
+        ));
+
+        // Sessions are shared across connection tasks: one client may open
+        // several streams (a pool) that all carry the same session id, and the
+        // stream that first delivered the knock is not necessarily the one that
+        // will carry the WireGuard datagrams. The map is only ever touched
+        // without holding it across an await, so a std mutex is enough.
+        type SessionMap = Arc<std::sync::Mutex<HashMap<[u8; 16], StreamSessionEntry>>>;
+        let sessions_by_id: SessionMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
+
+        loop {
+            tokio::select! {
+                biased;
+
+                _ = cancel_rx.changed() => {
+                    if *cancel_rx.borrow() {
+                        info!("TunnelServer stream shutting down via cancel signal");
+                        break;
+                    }
+                }
+
+                accepted = server.accept() => {
+                    let handle = match accepted {
+                        Ok(h) => h,
+                        Err(e) => {
+                            warn!("Stream accept failed: {e}");
+                            continue;
+                        }
+                    };
+                    let peer = handle.peer_addr;
+                    debug!("Accepted stream TURN connection from {peer}");
+
+                    // Each connection is served by its own task. The accept loop
+                    // must stay responsive: the client keeps a pool of parallel
+                    // streams, and serving them inline would leave every stream
+                    // but the first unread (its socket buffer fills up while
+                    // nothing drains it).
+                    let sessions = sessions_by_id.clone();
+                    let auth = auth.clone();
+                    let mut conn_cancel = cancel_rx.clone();
+                    let wg_endpoint_addr = self.config.wg_endpoint_addr;
+                    let metrics = self.metrics.clone();
+                    let coalesce_window = self.config.coalesce_window;
+                    tokio::spawn(async move {
+                        serve_stream_connection(
+                            handle,
+                            peer,
+                            auth,
+                            sessions,
+                            wg_endpoint_addr,
+                            metrics,
+                            coalesce_window,
+                            &mut conn_cancel,
+                        )
+                        .await;
+                    });
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn run_direct_with_notify(
+        &mut self,
+        listen_addr: SocketAddr,
+        mut cancel_rx: watch::Receiver<bool>,
+        on_allocated: Option<tokio::sync::oneshot::Sender<SocketAddr>>,
+    ) -> Result<(), TunnelError> {
+        info!(
+            "Starting TunnelServer in direct UDP / VK mode: listening on {listen_addr}, forwarding to WG {}",
+            self.config.wg_endpoint_addr
+        );
+
+        let socket = Arc::new(bind_tuned_udp_socket(listen_addr)?);
+        self.relayed_addr = Some(listen_addr);
+        if let Some(tx) = on_allocated {
+            let _ = tx.send(listen_addr);
+        }
+
+        let batched_sock = Arc::new(BatchedUdpSocket::new(socket.clone()));
+        let knock_key = derive_pre_auth_knock_key(&Psk::from_bytes(self.config.psk));
+        let mut auth = KnockAuthenticator::new(knock_key, DEFAULT_MAX_CLOCK_SKEW_SEC);
+
+        struct DirectSessionEntry {
+            sender: mpsc::Sender<BytesMut>,
+            peer_addr: Arc<std::sync::RwLock<SocketAddr>>,
+        }
+
+        let mut sessions_by_id: HashMap<[u8; 16], DirectSessionEntry> = HashMap::new();
+        let mut endpoint_to_session: HashMap<SocketAddr, [u8; 16]> = HashMap::new();
+
+        const BATCH_SIZE: usize = 16;
+        let mut batch_bufs: Vec<Vec<u8>> =
+            (0..BATCH_SIZE).map(|_| vec![0u8; MAX_PACKET_LEN]).collect();
+        let mut batch_metas: Vec<RecvMeta> = vec![RecvMeta::default(); BATCH_SIZE];
+
+        loop {
+            tokio::select! {
+                biased;
+
+                _ = cancel_rx.changed() => {
+                    if *cancel_rx.borrow() {
+                        info!("TunnelServer direct shutting down via cancel signal");
+                        break;
+                    }
+                }
+
+                batch_res = batched_sock.recv_batch(&mut batch_bufs, &mut batch_metas) => {
+                    match batch_res {
                         Ok(count) => {
+                            self.metrics.record_batch_rx(count);
                             for i in 0..count {
-                                let meta = wg_batch_metas[i];
-                                let payload = &wg_batch_bufs[i][..meta.len];
-                                let mut frame = BytesMut::new();
-                                encode_frame(FrameType::Data, 0, 0, seq_tx, payload, &mut frame);
-                                seq_tx = seq_tx.wrapping_add(1);
+                                let meta = batch_metas[i];
+                                let slice = &batch_bufs[i][..meta.len];
+                                let src_addr = meta.addr;
 
-                                if let Err(e) = turn_client.send_channel_data(&frame).await {
-                                    warn!("Failed to forward server WG packet over TURN: {e}");
-                                } else {
-                                    self.metrics.record_tx(meta.len);
+                                // 1. Check for Pre-Auth Knock (HandshakeInit)
+                                if let Ok((view, _)) = FrameView::decode(slice)
+                                    && view.header.frame_type == FrameType::HandshakeInit
+                                {
+                                    let now_sec = SystemTime::now()
+                                        .duration_since(UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_secs();
+
+                                    match auth.verify_knock_packet(now_sec, view.payload) {
+                                        Ok(knock_payload) => {
+                                            let session_id = knock_payload.session_id;
+                                            info!(
+                                                "Pre-Auth Knock verified for peer {} (session {:02X?})",
+                                                src_addr, &session_id[..4]
+                                            );
+
+                                            let is_new = !sessions_by_id.contains_key(&session_id)
+                                                || sessions_by_id.get(&session_id).unwrap().sender.is_closed();
+
+                                            if is_new {
+                                                let peer_addr_shared = Arc::new(std::sync::RwLock::new(src_addr));
+                                                let (session_tx, session_rx) = mpsc::channel(2048);
+                                                let worker = DirectSessionWorker {
+                                                    relayed_peer: peer_addr_shared.clone(),
+                                                    session_id,
+                                                    wg_endpoint_addr: self.config.wg_endpoint_addr,
+                                                    batched_sock: batched_sock.clone(),
+                                                    metrics: self.metrics.clone(),
+                                                    coalesce_window: self.config.coalesce_window,
+                                                    inbound_rx: session_rx,
+                                                };
+                                                let worker_cancel = cancel_rx.clone();
+                                                tokio::spawn(async move {
+                                                    if let Err(e) = worker.run(worker_cancel).await {
+                                                        warn!("DirectSessionWorker terminated: {e}");
+                                                    }
+                                                });
+                                                sessions_by_id.insert(
+                                                    session_id,
+                                                    DirectSessionEntry {
+                                                        sender: session_tx,
+                                                        peer_addr: peer_addr_shared,
+                                                    },
+                                                );
+                                            } else {
+                                                let entry = sessions_by_id.get_mut(&session_id).unwrap();
+                                                if let Ok(mut lock) = entry.peer_addr.write() {
+                                                    *lock = src_addr;
+                                                }
+                                            }
+
+                                            endpoint_to_session.insert(src_addr, session_id);
+
+                                            // Send HandshakeResp
+                                            let mut resp_frame = BytesMut::new();
+                                            encode_frame(
+                                                FrameType::HandshakeResp,
+                                                0,
+                                                0,
+                                                0,
+                                                b"WDTT2-OK",
+                                                &mut resp_frame,
+                                            );
+                                            let _ = socket.send_to(&resp_frame, src_addr).await;
+                                            continue;
+                                        }
+                                        Err(e) => {
+                                            debug!("Invalid knock from {src_addr} rejected: {e}");
+                                            continue;
+                                        }
+                                    }
                                 }
+
+                                // 2. Dispatch data/control datagram to session worker by session_id lookup
+                                if let Some(session_id) = endpoint_to_session.get(&src_addr)
+                                    && let Some(entry) = sessions_by_id.get(session_id)
+                                    && !entry.sender.is_closed()
+                                {
+                                    let mut b = BytesMut::new();
+                                    b.extend_from_slice(slice);
+                                    if let Err(e) = entry.sender.try_send(b) {
+                                        warn!("Dispatch to session worker queue full: {e}");
+                                    }
+                                    continue;
+                                }
+
+                                // 3. Silent drop of unauthenticated packets
+                                trace!("Unauthenticated packet from {src_addr} dropped silently");
                             }
+
+                            // Prune closed sessions
+                            sessions_by_id.retain(|_, entry| !entry.sender.is_closed());
+                            endpoint_to_session.retain(|_, id| sessions_by_id.contains_key(id));
                         }
                         Err(e) => {
-                            error!("Error reading from WireGuard forwarder: {e}");
+                            trace!("Direct UDP recv error: {e}");
                         }
                     }
                 }

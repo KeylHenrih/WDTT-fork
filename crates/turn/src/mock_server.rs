@@ -2,6 +2,7 @@ use crate::channel::{decode_channel_data, encode_channel_data, is_channel_data};
 use crate::error::TurnError;
 use crate::stun::*;
 use bytes::BytesMut;
+use rand::RngCore;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -57,13 +58,34 @@ impl MockTurnServer {
                 // 1. ChannelData Relay Routing
                 if is_channel_data(slice) {
                     if let Ok((chan, payload, _)) = decode_channel_data(slice) {
-                        // Find other client to relay to, otherwise echo
+                        let sender_relayed = sessions.get(&client_addr).map(|s| s.relayed_addr);
                         let other_client =
                             sessions.keys().copied().find(|addr| *addr != client_addr);
                         let dest = other_client.unwrap_or(client_addr);
-                        let mut resp = BytesMut::new();
-                        let _ = encode_channel_data(chan, &payload, false, &mut resp);
-                        let _ = s_sock.send_to(&resp, dest).await;
+
+                        let dest_channel = sessions.get(&dest).and_then(|s| s.channel);
+                        if dest == client_addr {
+                            // Loopback echo for unit test verification
+                            let mut resp = BytesMut::new();
+                            let _ = encode_channel_data(chan, &payload, false, &mut resp);
+                            let _ = s_sock.send_to(&resp, dest).await;
+                        } else if let Some(dest_chan) = dest_channel {
+                            let mut resp = BytesMut::new();
+                            let _ = encode_channel_data(dest_chan, &payload, false, &mut resp);
+                            let _ = s_sock.send_to(&resp, dest).await;
+                        } else if let Some(peer_addr) = sender_relayed {
+                            let mut tid = [0u8; 12];
+                            rand::rng().fill_bytes(&mut tid);
+                            let msg = StunMessage::new(DATA_INDICATION, tid)
+                                .with_attribute(StunAttribute::XorPeerAddress(peer_addr))
+                                .with_attribute(StunAttribute::Data(payload));
+                            let encoded = msg.encode();
+                            let _ = s_sock.send_to(&encoded, dest).await;
+                        } else {
+                            let mut resp = BytesMut::new();
+                            let _ = encode_channel_data(chan, &payload, false, &mut resp);
+                            let _ = s_sock.send_to(&resp, dest).await;
+                        }
                     }
                     continue;
                 }

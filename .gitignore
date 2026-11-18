@@ -9,6 +9,8 @@ target/
 *.exe
 
 # Fuzzing artifacts
+fuzz/target/
+**/fuzz/target/
 fuzz/corpus/
 fuzz/artifacts/
 
@@ -16,7 +18,9 @@ fuzz/artifacts/
 *.env
 *.env.*
 *.link
-*link*
+*.link.*
+*link.json
+*link.txt
 link
 passwords*.json
 *.key
@@ -24,14 +28,19 @@ passwords*.json
 *.crt
 *.pfx
 
-# Logs and profiling data
+# Logs, profiling data, and dumps
 *.log
 transcript*
 transcript*.jsonl
 perf.data*
+flamegraph*.svg
+perf*.svg
+*.folded
+*.sarif
 *.pcap
 *.pcapng
-/tmp/*
+tmp/
+/tmp/
 
 # Editor and OS files
 .DS_Store

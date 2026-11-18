@@ -64,6 +64,8 @@ pub struct BatchCapabilities {
     pub has_gro: bool,
     /// Whether UDP Generic Segmentation Offload (GSO) is supported and active.
     pub has_gso: bool,
+    /// Whether short batch readiness clearing is disabled (for benchmarking).
+    pub disable_short_batch_clear: bool,
 }
 
 impl BatchCapabilities {
@@ -74,6 +76,7 @@ impl BatchCapabilities {
             has_sendmmsg: false,
             has_gro: false,
             has_gso: false,
+            disable_short_batch_clear: false,
         }
     }
 
@@ -83,6 +86,7 @@ impl BatchCapabilities {
         let disable_batch = std::env::var("WDTT_DISABLE_BATCH").is_ok();
         let disable_gro = std::env::var("WDTT_DISABLE_GRO").is_ok();
         let disable_gso = std::env::var("WDTT_DISABLE_GSO").is_ok();
+        let disable_short_batch_clear = std::env::var("WDTT_DISABLE_SHORT_BATCH_CLEAR").is_ok();
 
         let has_recvmmsg = !disable_batch;
         let has_sendmmsg = !disable_batch;
@@ -144,6 +148,7 @@ impl BatchCapabilities {
             has_sendmmsg,
             has_gro,
             has_gso,
+            disable_short_batch_clear,
         }
     }
 }
@@ -234,10 +239,10 @@ impl BatchedUdpSocket {
         metas: &mut [RecvMeta],
     ) -> io::Result<usize> {
         let fd = self.socket.as_raw_fd();
-        self.socket
+        let batch_size = buffers.len().min(metas.len());
+        let res = self
+            .socket
             .async_io(Interest::READABLE, || {
-                let batch_size = buffers.len().min(metas.len());
-
                 let mut hdrs: Vec<libc::mmsghdr> = Vec::with_capacity(batch_size);
                 let mut iovecs: Vec<libc::iovec> = Vec::with_capacity(batch_size);
                 let mut addrs: Vec<libc::sockaddr_storage> = Vec::with_capacity(batch_size);
@@ -325,7 +330,18 @@ impl BatchedUdpSocket {
 
                 Ok(pkts_read)
             })
-            .await
+            .await?;
+
+        // Short batch (< batch_size) proves the UDP socket receive queue is now empty.
+        // Explicitly clear Tokio's readiness flag so that the subsequent iteration does NOT
+        // issue a doomed recvmmsg syscall that returns EAGAIN/WouldBlock.
+        if res < batch_size && !self.caps.disable_short_batch_clear {
+            let _: io::Result<()> = self.socket.try_io(Interest::READABLE, || {
+                Err(io::Error::from(io::ErrorKind::WouldBlock))
+            });
+        }
+
+        Ok(res)
     }
 
     // --- Linux sendmmsg Implementation with GSO support ---
@@ -639,5 +655,41 @@ mod tests {
         let read = b_srv.recv_batch(&mut bufs, &mut metas).await.unwrap();
         assert_eq!(read, 1);
         assert_eq!(&bufs[0][..metas[0].len], payload);
+    }
+
+    #[tokio::test]
+    async fn test_recvmmsg_short_batch_readiness_and_no_lost_wakeups() {
+        use std::time::Duration;
+        let srv = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let srv_addr = srv.local_addr().unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let batched = BatchedUdpSocket::new(srv);
+
+        // Send packet 1
+        client.send_to(b"pkt1", srv_addr).await.unwrap();
+
+        let mut bufs = vec![vec![0u8; 1024]; 16];
+        let mut metas = vec![RecvMeta::default(); 16];
+
+        // Read packet 1: should return 1 (< 16), and clear readiness
+        let n1 = batched.recv_batch(&mut bufs, &mut metas).await.unwrap();
+        assert_eq!(n1, 1);
+        assert_eq!(&bufs[0][..metas[0].len], b"pkt1");
+
+        // Send packet 2 shortly after
+        client.send_to(b"pkt2", srv_addr).await.unwrap();
+
+        // Verify packet 2 is received without losing epoll wakeup!
+        let n2 = tokio::time::timeout(
+            Duration::from_millis(200),
+            batched.recv_batch(&mut bufs, &mut metas),
+        )
+        .await
+        .expect("Must not deadlock or lose wakeup")
+        .unwrap();
+
+        assert_eq!(n2, 1);
+        assert_eq!(&bufs[0][..metas[0].len], b"pkt2");
     }
 }

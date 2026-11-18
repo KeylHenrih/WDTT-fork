@@ -1,0 +1,54 @@
+{
+  "cost_floor_benchmarks": [],
+  "idle_benchmarks": [
+    {
+      "mode": "Idle Interface DOWN",
+      "keepalive": "disabled",
+      "wg_interface": "DOWN",
+      "duration_sec": 5,
+      "settle_sec": 0,
+      "context_switches_total": 0,
+      "context_switches_per_sec": 0.0,
+      "cpu_percent": 0.0,
+      "pidstat_cswch_s": 0.0,
+      "pidstat_nvcswch_s": 0.0
+    },
+    {
+      "mode": "Idle Interface UP (PowerSave Initial 10s)",
+      "keepalive": "powersave",
+      "wg_interface": "UP",
+      "duration_sec": 10,
+      "settle_sec": 0,
+      "context_switches_total": 2,
+      "context_switches_per_sec": 0.2,
+      "cpu_percent": 0.001,
+      "pidstat_cswch_s": 0.0,
+      "pidstat_nvcswch_s": 0.0
+    },
+    {
+      "mode": "Idle Interface UP (PowerSave Steady State after 60s)",
+      "keepalive": "powersave",
+      "wg_interface": "UP",
+      "duration_sec": 20,
+      "settle_sec": 60,
+      "context_switches_total": 1,
+      "context_switches_per_sec": 0.05,
+      "cpu_percent": 0.0,
+      "pidstat_cswch_s": 0.5,
+      "pidstat_nvcswch_s": 0.0
+    },
+    {
+      "mode": "Idle Interface UP (Chaff Voice)",
+      "keepalive": "chaff",
+      "wg_interface": "UP",
+      "duration_sec": 5,
+      "settle_sec": 0,
+      "context_switches_total": 579,
+      "context_switches_per_sec": 115.8,
+      "cpu_percent": 0.509,
+      "pidstat_cswch_s": 230.8,
+      "pidstat_nvcswch_s": 0.0
+    }
+  ],
+  "rate_benchmarks": []
+}

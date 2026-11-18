@@ -20,13 +20,13 @@ version = "0.1.0"
 edition = "2024"
 license = "GPL-3.0-only"
 authors = ["The WDTT Authors"]
-repository = "https://github.com/wdtt-rs/wdtt"
+repository = "https://github.com/KeylHenrih/WDTT-fork"
 
 [workspace.dependencies]
 # Core utilities
 bytes = "1.10"
 thiserror = "2.0"
-tracing = "0.1"
+tracing = { version = "0.1", features = ["release_max_level_info"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio = { version = "1.43", features = ["full"] }
 socket2 = { version = "0.5", features = ["all"] }
@@ -37,6 +37,7 @@ serde_json = "1.0"
 postcard = { version = "1.1", default-features = false, features = ["alloc"] }
 url = "2.5"
 siphasher = "1.0"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
 # Cryptography
 chacha20poly1305 = "0.10"
@@ -49,6 +50,9 @@ hmac = "0.12"
 zeroize = { version = "1.8", features = ["derive"] }
 subtle = "2.6"
 rand = "0.9"
+
+# WireGuard
+boringtun = "0.7.1"
 
 # Testing
 proptest = "1.6"

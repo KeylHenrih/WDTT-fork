@@ -11,8 +11,9 @@ Asynchronous STUN and TURN (RFC 5389 / RFC 5766 / RFC 6156) client implementatio
 - **Async Client**: Non-blocking Tokio-based TURN client managing allocation lifecycle, permissions, channel binding, and background keepalive refreshing.
 - **Embedded Mock Server**: Built-in test harness supporting end-to-end multi-client relay routing (`Client A <-> Relay <-> Client B`), 438 recovery, and error simulation without external daemons.
 - **Coturn Integration**: Docker/Podman compose configurations for validation against production Coturn relays.
+- **Stream Pool**: Keeps several TCP/TLS allocations established at once and hands them out one at a time, so losing one stream does not stall the datapath. Idle streams are probed with a `Refresh` and retired when they stop answering; establishment is bounded by a connect timeout.
 
 ## Transport & Protocol Roadmap
 - **UDP Transport**: Fully implemented and tested in Phase 2.
-- **TCP / TLS Transports (RFC 5766 / RFC 6062)**: Framework interfaces defined; full multi-platform network socket integration is scheduled for **Phase 4** (Desktop/Mobile Client Networking & NAT Traversal).
-- **IPv6 Relaying (RFC 6156)**: Dual-stack XOR-address encoding implemented; production multi-homed IPv6 routing scheduled for **Phase 4**.
+- **TCP / TLS Transports (RFC 5766 / RFC 6062)**: Implemented for the stream client and server (see `stream_client.rs` / `stream_server.rs`), including the pooled multi-stream datapath.
+- **IPv6 Relaying (RFC 6156)**: Dual-stack XOR-address encoding implemented; routing sets are IPv4-only for now, so IPv6 ranges are dropped and reported as approximations.

@@ -29,9 +29,9 @@ TURN_PASS = "benchpass"
 TURN_REALM = "wdtt-matrix"
 PSK = "stage4matrixbenchmarksecret2026v2"
 
-# CPU Core Pinning Map (Intel Core 5 220H)
+# CPU Core Pinning Map (x86_64, 16 threads, Linux)
 # P-cores: Core 0 (0,1), Core 1 (2,3), Core 2 (4,5), Core 3 (6,7)
-# E-cores: Core 4 (8), Core 5 (9), Core 6 (10), Core 7 (11)
+# Load-generator cores: Core 4 (8), Core 5 (9), Core 6 (10), Core 7 (11)
 CPU_COTURN = "2"   # P-core 1
 CPU_SERVER = "4"   # P-core 2
 CPU_CLIENT = "6"   # P-core 3

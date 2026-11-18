@@ -24,9 +24,9 @@ TURN_PASS = "cleanpass"
 TURN_REALM = "wdtt-clean"
 PSK = "stage4cleanbenchmarksecret2026v2"
 
-# CPU Core Pinning Map (Honor MagicBook Intel Core 5 220H)
+# CPU Core Pinning Map (x86_64, 16 threads, Linux)
 # P-cores: Core 0 (0,1), Core 1 (2,3), Core 2 (4,5), Core 3 (6,7)
-# E-cores: Core 4 (8), Core 5 (9), Core 6 (10), Core 7 (11)
+# Load-generator cores: Core 4 (8), Core 5 (9), Core 6 (10), Core 7 (11)
 CPU_COTURN = "2"   # P-core 1
 CPU_SERVER = "4"   # P-core 2
 CPU_CLIENT = "6"   # P-core 3
@@ -68,6 +68,8 @@ def main():
     parser.add_argument("--disable-sock-tune", action="store_true", help="Do not tune socket buffers (use kernel default ~208 KB)")
     parser.add_argument("--enable-perf", action="store_true", help="Run low-overhead perf record -F 99")
     parser.add_argument("--duration", type=int, default=10, help="Test duration in seconds")
+    parser.add_argument("--server-runtime", default="multi_thread", choices=["multi_thread", "current_thread"], help="Tokio runtime for server")
+    parser.add_argument("--server-workers", type=int, default=2, help="Number of worker threads for server")
     args = parser.parse_args()
 
     signal.signal(signal.SIGINT, lambda s, f: (cleanup(), sys.exit(1)))
@@ -77,15 +79,21 @@ def main():
     os.makedirs(TEST_DIR, exist_ok=True)
 
     try:
-        res = run_benchmark(disable_sock_tune=args.disable_sock_tune, enable_perf=args.enable_perf, duration=args.duration)
+        res = run_benchmark(
+            disable_sock_tune=args.disable_sock_tune,
+            enable_perf=args.enable_perf,
+            duration=args.duration,
+            server_runtime=args.server_runtime,
+            server_workers=args.server_workers,
+        )
         print("\n--- BENCHMARK RESULT JSON ---")
         print(json.dumps(res, indent=2))
     finally:
         cleanup()
 
-def run_benchmark(disable_sock_tune=False, enable_perf=False, duration=10):
+def run_benchmark(disable_sock_tune=False, enable_perf=False, duration=10, server_runtime="multi_thread", server_workers=2):
     print(f"\n=======================================================")
-    print(f"  RUNNING BENCHMARK (disable_sock_tune={disable_sock_tune}, duration={duration}s)")
+    print(f"  RUNNING BENCHMARK (disable_sock_tune={disable_sock_tune}, duration={duration}s, server_runtime={server_runtime}, workers={server_workers})")
     print(f"=======================================================\n")
 
     # Step 1: netns + veth
@@ -160,6 +168,8 @@ def run_benchmark(disable_sock_tune=False, enable_perf=False, duration=10):
         "--wg-endpoint", "127.0.0.1:51850",
         "--psk", PSK,
         "--relayed-addr-file", relayed_file,
+        "--runtime", server_runtime,
+        "--workers", str(server_workers),
     ]
     server_log = open(os.path.join(TEST_DIR, "server.log"), "w")
     server_proc = subprocess.Popen(server_cmd, env=env, stdout=server_log, stderr=server_log)
@@ -187,6 +197,7 @@ def run_benchmark(disable_sock_tune=False, enable_perf=False, duration=10):
         "--server-relayed", server_relayed_addr,
         "--wg-listen", "127.0.0.1:51851",
         "--psk", PSK,
+        "--runtime", "current_thread",
     ]
     client_log = open(os.path.join(TEST_DIR, "client.log"), "w")
     client_proc = subprocess.Popen(client_cmd, env=env, stdout=client_log, stderr=client_log)
@@ -254,7 +265,7 @@ def run_benchmark(disable_sock_tune=False, enable_perf=False, duration=10):
         perf_proc.wait()
 
     # Post-run stats
-    nstat_out = run_cmd("nstat -a | grep -E 'UdpRcvbufErrors|UdpInErrors' || true").stdout
+    nstat_out = run_cmd("nstat -a | grep -E 'UdpRcvbufErrors|UdpInErrors|TcpExtTCPSACKReorder|TcpExtTCPLostRetransmit' || true").stdout
     veth_h = run_cmd("ip -s link show dev veth-cln-host").stdout
     veth_c = run_cmd("sudo ip netns exec wdtt-cln-ns ip -s link show dev veth-cln-cl").stdout
 

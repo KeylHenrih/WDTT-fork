@@ -141,6 +141,11 @@ impl TurnClient {
         Duration::from_secs(((sec * 3) / 4).max(10))
     }
 
+    /// Return configured channel number.
+    pub fn channel_number(&self) -> u16 {
+        self.config.channel_number
+    }
+
     /// Retrieve the allocated relayed address, if allocation succeeded.
     pub fn relayed_addr(&self) -> Option<SocketAddr> {
         self.relayed_addr
@@ -153,9 +158,19 @@ impl TurnClient {
 
     /// Update target peer and establish permission and channel binding.
     pub async fn bind_peer(&mut self, peer_addr: SocketAddr) -> Result<(), TurnError> {
+        self.bind_peer_channel(peer_addr, self.config.channel_number)
+            .await
+    }
+
+    /// Update target peer and establish permission and channel binding to a specific channel number.
+    pub async fn bind_peer_channel(
+        &mut self,
+        peer_addr: SocketAddr,
+        channel_number: u16,
+    ) -> Result<(), TurnError> {
         self.config.peer_addr = peer_addr;
         self.create_permission_internal().await?;
-        self.channel_bind_internal().await?;
+        self.channel_bind_custom(peer_addr, channel_number).await?;
         Ok(())
     }
 
@@ -270,8 +285,18 @@ impl TurnClient {
 
     /// Send a data packet encapsulated in a TURN ChannelData message to the relay.
     pub async fn send_channel_data(&self, payload: &[u8]) -> Result<(), TurnError> {
+        self.send_channel_data_to(self.config.channel_number, payload)
+            .await
+    }
+
+    /// Send a data packet encapsulated in a TURN ChannelData message on a specific channel.
+    pub async fn send_channel_data_to(
+        &self,
+        channel: u16,
+        payload: &[u8],
+    ) -> Result<(), TurnError> {
         let mut buf = BytesMut::new();
-        encode_channel_data(self.config.channel_number, payload, false, &mut buf)?;
+        encode_channel_data(channel, payload, false, &mut buf)?;
         self.socket.send_to(&buf, self.config.server_addr).await?;
         Ok(())
     }
@@ -299,6 +324,22 @@ impl TurnClient {
     /// Reference to the underlying UDP socket.
     pub fn socket(&self) -> &Arc<UdpSocket> {
         &self.socket
+    }
+
+    /// Rebind the underlying UDP socket to a new local address (e.g. simulating NAT rebinding).
+    pub async fn rebind_socket(&mut self, local_addr: SocketAddr) -> Result<(), TurnError> {
+        let std_sock = std::net::UdpSocket::bind(local_addr)?;
+        std_sock.set_nonblocking(true)?;
+        self.socket = Arc::new(UdpSocket::from_std(std_sock)?);
+        self.relayed_addr = None;
+        Ok(())
+    }
+
+    /// Re-establish allocation and peer bindings after connection loss or NAT rebinding.
+    pub async fn reconnect(&mut self) -> Result<SocketAddr, TurnError> {
+        let relayed = self.allocate_relay().await?;
+        self.bind_peer(self.config.peer_addr).await?;
+        Ok(relayed)
     }
 
     /// Parse an incoming raw datagram received from `src` into a TurnIncoming message.
@@ -384,12 +425,22 @@ impl TurnClient {
     }
 
     async fn channel_bind_internal(&mut self) -> Result<(), TurnError> {
+        self.channel_bind_custom(self.config.peer_addr, self.config.channel_number)
+            .await
+    }
+
+    /// Perform authenticated ChannelBind for specified peer address and channel number.
+    pub async fn channel_bind_custom(
+        &mut self,
+        peer_addr: SocketAddr,
+        channel_number: u16,
+    ) -> Result<(), TurnError> {
         let mut tx_id = [0u8; 12];
         rand::rng().fill_bytes(&mut tx_id);
 
         let req = StunMessage::new(CHANNEL_BIND_REQUEST, tx_id)
-            .with_attribute(StunAttribute::ChannelNumber(self.config.channel_number))
-            .with_attribute(StunAttribute::XorPeerAddress(self.config.peer_addr))
+            .with_attribute(StunAttribute::ChannelNumber(channel_number))
+            .with_attribute(StunAttribute::XorPeerAddress(peer_addr))
             .with_attribute(StunAttribute::Username(self.config.username.clone()))
             .with_attribute(StunAttribute::Realm(self.realm.clone()))
             .with_attribute(StunAttribute::Nonce(self.nonce.clone()));
@@ -403,7 +454,7 @@ impl TurnClient {
         }
         info!(
             "TURN ChannelBind succeeded: channel 0x{:04X} -> {}",
-            self.config.channel_number, self.config.peer_addr
+            channel_number, peer_addr
         );
         Ok(())
     }

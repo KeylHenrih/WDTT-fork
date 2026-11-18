@@ -74,6 +74,11 @@ All benchmarks below reflect reproducible hardware measurements ([docs/BENCHMARK
 | **Process Memory (RSS)** | 40–90 MB (Go), 180–260 MB (Wails GUI) | **3.9 MB** (server), **4.0 MB** (client daemon) | Native binary footprint without embedded browser engines |
 | **Active DPI Probe Reaction** | DTLS Alert / Handshake response | **0 bytes (Silent Discard)** | Pre-Auth Knock drops unauthorized probes prior to reply |
 
+### 4.1 Profiles and Keepalive Modes
+
+- **PowerSave (default):** adaptive probing with Pong feedback loop (start 20s, step +2s, ceiling 25s, floor 10s) and non-reversible network identity caching (`NetworkId`). Guarantees near-zero idle load (0.05 wakeups/s) and maximum battery preservation.
+- **Chaff [Experimental]:** continuous Opus voice codec emulation (50 pps @ 20ms) with variable random padding (60–140 bytes) to defeat heuristic DPI classification. Incurs non-trivial context switch cost (~115.8 CS/s) and keeps cellular modems from entering C-DRX low-power states; enabled strictly via `--keepalive chaff`.
+
 ---
 
 ## 5. Quick Start: Building and Local Testing
@@ -84,7 +89,7 @@ All benchmarks below reflect reproducible hardware measurements ([docs/BENCHMARK
 
 ### 5.1 Compiling
 ```bash
-git clone https://github.com/KeylHenrih/WDTT-fork.git wdtt-rs
+git clone https://github.com/KeylHenrih/WDTT-fork.git
 cd wdtt-rs
 
 # Compile all workspace crates in release mode

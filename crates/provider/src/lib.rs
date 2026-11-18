@@ -6,6 +6,17 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+pub mod cache;
+pub mod factory;
+pub mod vk;
+
+pub use cache::{
+    CachedTurnEndpoint, CachedVkCredentials, VkRequestCounter, load_cached_credentials,
+    load_raw_cached_credentials, save_cached_credentials,
+};
+pub use factory::{ProviderConfig, ProviderKind, build_provider};
+pub use vk::{CaptchaMode, VkTurnProvider};
+
 use async_trait::async_trait;
 
 /// Error type returned by TURN credential providers.
@@ -28,6 +39,15 @@ pub enum ProviderError {
     RateLimited {
         /// Suggested retry interval in seconds.
         retry_after_secs: u32,
+    },
+
+    /// Challenge requiring user interaction (e.g. captcha).
+    #[error("user interaction required: {challenge_url}")]
+    NeedsUserInteraction {
+        /// URL of the challenge.
+        challenge_url: String,
+        /// Optional session token.
+        session_token: String,
     },
 
     /// Other provider-specific error.

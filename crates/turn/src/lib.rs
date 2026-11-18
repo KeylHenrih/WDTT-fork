@@ -5,7 +5,11 @@ pub mod channel;
 pub mod client;
 pub mod error;
 pub mod mock_server;
+pub mod pool;
+pub mod stream_client;
+pub mod stream_server;
 pub mod stun;
+pub mod transport;
 
 pub use channel::{
     CHANNEL_DATA_HEADER_LEN, CHANNEL_MAX, CHANNEL_MIN, decode_channel_data, encode_channel_data,
@@ -14,6 +18,12 @@ pub use channel::{
 pub use client::{TurnClient, TurnClientConfig, TurnIncoming};
 pub use error::TurnError;
 pub use mock_server::MockTurnServer;
+pub use pool::{
+    DEFAULT_MAX_STREAMS, DEFAULT_POOL_SIZE, DEFAULT_PROBE_TIMEOUT, StreamGuard, StreamPool,
+    establish_pool,
+};
+pub use stream_client::{StreamClientConfig, StreamTurnClient};
+pub use stream_server::{StreamConnectionHandle, StreamServerConfig, StreamTurnServer};
 pub use stun::{
     ALLOCATE_REQUEST, ALLOCATE_RESPONSE, BINDING_REQUEST, BINDING_RESPONSE, CHANNEL_BIND_REQUEST,
     CHANNEL_BIND_RESPONSE, CODE_ALLOCATION_MISMATCH, CODE_ALLOCATION_QUOTA_REACHED,
@@ -21,6 +31,7 @@ pub use stun::{
     CREATE_PERMISSION_REQUEST, CREATE_PERMISSION_RESPONSE, REFRESH_REQUEST, REFRESH_RESPONSE,
     STUN_MAGIC_COOKIE, StunAttribute, StunMessage, compute_long_term_key,
 };
+pub use transport::{BoundedTxQueue, TurnTransportMode, decode_tcp_frame, encode_tcp_channel_data};
 
 #[cfg(test)]
 mod tests {
