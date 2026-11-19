@@ -743,6 +743,83 @@ async fn async_main(mut args: ClientArgs) -> Result<(), Box<dyn std::error::Erro
     let client_task =
         tokio::spawn(async move { client.run_with_notify(cancel_rx, Some(ready_tx)).await });
 
+    // -----------------------------------
+    // IPC server (Unix socket) – handles IpcRequest from GUI apps.
+    // Only GetStatus is fully supported for now.
+    // -----------------------------------
+    #[cfg(target_os = "linux")]
+    spawn_ipc_server("/tmp/wdttd.ipc", metrics.clone(), cancel_tx.clone());
+
+    #[cfg(target_os = "linux")]
+    fn spawn_ipc_server(
+        listen_addr: &str,
+        metrics: std::sync::Arc<wdtt_core::metrics::TunnelMetrics>,
+        cancel_tx: watch::Sender<bool>,
+    ) {
+        use tokio::net::UnixListener;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use wdtt_ipc::{IpcRequest, IpcResponse};
+        let _ = std::fs::remove_file(listen_addr);
+        let Ok(listener) = UnixListener::bind(listen_addr) else {
+            warn!("Failed to bind IPC socket {listen_addr} — IPC disabled");
+            return;
+        };
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = match listener.accept().await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        warn!("IPC accept error: {e}");
+                        break;
+                    }
+                };
+                let mut buf = vec![0u8; 4096];
+                let n = match stream.read(&mut buf).await {
+                    Ok(0) => continue,
+                    Ok(n) => n,
+                    Err(e) => {
+                        warn!("IPC read error: {e}");
+                        continue;
+                    }
+                };
+                let req: IpcRequest = match postcard::from_bytes(&buf[..n]) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        warn!("IPC deserialize error: {e}");
+                        continue;
+                    }
+                };
+                let resp = match req {
+                    IpcRequest::GetStatus => {
+                        let snap = metrics.snapshot();
+                        IpcResponse::Status {
+                            connected: true,
+                            tx_bytes_per_sec: snap.bytes_tx,
+                            rx_bytes_per_sec: snap.bytes_rx,
+                            rtt_ms: snap.rtt_latest_ms as u32,
+                        }
+                    }
+                    IpcRequest::Connect { config_uri: _ } => {
+                        IpcResponse::Error("Connect via IPC not implemented".into())
+                    }
+                    IpcRequest::Disconnect => {
+                        let _ = cancel_tx.send(true);
+                        IpcResponse::Ok
+                    }
+                };
+                let out = match postcard::to_allocvec(&resp) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!("IPC serialize error: {e}");
+                        continue;
+                    }
+                };
+                if let Err(e) = stream.write_all(&out).await {
+                    warn!("IPC write error: {e}");
+                }
+            }
+        });
+    }
     match ready_rx.await {
         Ok(relayed_addr) => {
             info!("Client allocated relay address: {relayed_addr}");

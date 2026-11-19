@@ -3622,6 +3622,7 @@ dependencies = [
 name = "wdttd"
 version = "0.1.0"
 dependencies = [
+ "postcard",
  "serde_json",
  "socket2 0.5.10",
  "thiserror 2.0.21",
@@ -3630,6 +3631,7 @@ dependencies = [
  "tracing-subscriber",
  "wdtt-core",
  "wdtt-crypto",
+ "wdtt-ipc",
  "wdtt-proto",
  "wdtt-provider",
  "wdtt-tun",
