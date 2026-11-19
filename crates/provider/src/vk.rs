@@ -16,8 +16,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{error, info, warn};
 
 const VK_CLIENT_ID: &str = "8202606";
-const VK_CLIENT_SECRET: &str = "lMRsTiMCyPnp5vfoldmn";
+const VK_CLIENT_SECRET_ENV: &str = "WDTT_VK_CLIENT_SECRET";
 const OK_APP_KEY: &str = "CGMMEJLGDIHBABABA";
+
+/// Reads the VK Calls client secret from the `WDTT_VK_CLIENT_SECRET`
+/// environment variable. The secret is never committed to the tree; a
+/// deployment without it fails fast with a clear authentication error.
+fn vk_client_secret() -> Result<String, ProviderError> {
+    std::env::var(VK_CLIENT_SECRET_ENV)
+        .map_err(|_| ProviderError::Authentication(format!("missing {VK_CLIENT_SECRET_ENV} environment variable")))
+}
 
 /// Parsed TURN allocation credentials from OK CDN response.
 struct TurnAllocationInfo {
@@ -157,12 +165,13 @@ impl VkTurnProvider {
         // Step 1: Anonymous Access Token (token1)
         self.counter.next_request()?;
         info!("[VK Calls] Request 1/5: Fetching anonymous access token...");
+        let client_secret = vk_client_secret()?;
         let step1_resp = client
             .post("https://login.vk.ru/?act=get_anonym_token")
             .form(&[
                 ("client_id", VK_CLIENT_ID),
                 ("token_type", "messages"),
-                ("client_secret", VK_CLIENT_SECRET),
+                ("client_secret", &client_secret),
                 ("version", "1"),
                 ("app_id", VK_CLIENT_ID),
             ])

@@ -472,7 +472,7 @@ mod tests {
         let cfg = HostSetupConfig::new(
             "wdtt0",
             "10.99.99.2".parse().unwrap(),
-            "89.125.237.142".parse().unwrap(),
+            "192.0.2.10".parse().unwrap(),
             "wlan0",
         );
         assert!(cfg.policy_routing);
@@ -486,7 +486,7 @@ mod tests {
         let cfg = HostSetupConfig::new(
             "wdtt0",
             "10.99.99.2".parse().unwrap(),
-            "89.125.237.142".parse().unwrap(),
+            "192.0.2.10".parse().unwrap(),
             "wlan0",
         );
         let setup = HostSetup::new(cfg);
@@ -498,7 +498,7 @@ mod tests {
         let cfg = HostSetupConfig::new(
             "wdtt0",
             "10.99.99.2".parse().unwrap(),
-            "89.125.237.142".parse().unwrap(),
+            "192.0.2.10".parse().unwrap(),
             "wlan0",
         );
         let mut setup = HostSetup::new(cfg);
