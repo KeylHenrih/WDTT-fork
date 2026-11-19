@@ -9,6 +9,7 @@
 pub mod cache;
 pub mod factory;
 pub mod namegen;
+pub mod nickname;
 pub mod vk;
 
 pub use cache::{
@@ -17,6 +18,7 @@ pub use cache::{
 };
 pub use factory::{ProviderConfig, ProviderKind, build_provider};
 pub use namegen::generate_name;
+pub use nickname::generate_nickname;
 pub use vk::{CaptchaMode, VkTurnProvider};
 
 use async_trait::async_trait;
