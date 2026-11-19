@@ -57,6 +57,7 @@ flowchart LR
 | **`wdttd`** | [`crates/daemon`](crates/daemon) | Клиентский демон для Linux, Windows, macOS | **Реализовано** (проверен в связке с ядром WireGuard) |
 | **`wdtt-ipc`** | [`crates/ipc`](crates/ipc) | Межпроцессное взаимодействие UI и демона (Zero-Copy Postcard) | **Реализовано** (базовая схема IPC) |
 | **`wdtt-gui`** | [`crates/gui-desktop`](crates/gui-desktop) | Графический интерфейс на `wry`/`tao` (+ рабочий `captcha_helper`) | **В разработке** (каркас) |
+| **`wdtt-provider`** | [`crates/provider`](crates/provider) | Провайдеры TURN-кредов: статический и VK Calls (кеширование, rate-limit, капча, генератор имени участника `generate_name`) | **Реализовано** (этап 5) |
 | **`wdtt-android`** | [`crates/ffi-android`](crates/ffi-android) | Kotlin Jetpack Compose UI + Rust Core (UniFFI / VpnService) | **В разработке** (каркас FFI собран в CI, UI на Этапе 4) |
 
 ---
