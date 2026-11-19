@@ -205,7 +205,7 @@ impl VkTurnProvider {
         let anon_url = format!(
             "https://api.vk.ru/method/calls.getAnonymousToken?v=5.275&client_id={VK_CLIENT_ID}"
         );
-        let pseudorandom_name = format!("User{}", rand_num());
+        let pseudorandom_name = crate::namegen::generate_name();
 
         let step3_resp = client
             .post(&anon_url)
@@ -734,17 +734,18 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
-fn rand_num() -> u32 {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_nanos();
-    1000 + (nanos % 9000)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Unique suffix for per-test cache filenames.
+    fn rand_num() -> u32 {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos();
+        1000 + (nanos % 9000)
+    }
 
     #[test]
     fn test_parse_turn_uri() {

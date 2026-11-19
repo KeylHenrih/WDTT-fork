@@ -8,6 +8,7 @@
 
 pub mod cache;
 pub mod factory;
+pub mod namegen;
 pub mod vk;
 
 pub use cache::{
@@ -15,6 +16,7 @@ pub use cache::{
     load_raw_cached_credentials, save_cached_credentials,
 };
 pub use factory::{ProviderConfig, ProviderKind, build_provider};
+pub use namegen::generate_name;
 pub use vk::{CaptchaMode, VkTurnProvider};
 
 use async_trait::async_trait;

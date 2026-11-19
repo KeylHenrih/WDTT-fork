@@ -41,6 +41,8 @@ perf*.svg
 *.pcapng
 tmp/
 /tmp/
+# Harness scratch, test keys and netns scripts; never part of either repo.
+/tmp/opencode/
 
 # Editor and OS files
 .DS_Store

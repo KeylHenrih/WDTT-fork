@@ -516,13 +516,13 @@ pub fn render_ruleset(ruleset: &CompiledRuleset) -> String {
         "\t\ttype route hook output priority mangle; policy accept;"
     );
 
-    // DNS must resolve through the host's own resolver even in inverted mode:
-    // routing lookups through the tunnel would return foreign addresses and
-    // break the very white list the exclusion set encodes.
-    for line in render_dns_bypass() {
-        let _ = writeln!(out, "\t\t{line}");
-    }
-
+    // No port-based DNS exemption is emitted here. Exempting ports 53/853
+    // would send a lookup to a foreign resolver directly, in the clear, which
+    // is exactly what the inversion is meant to prevent. A resolver inside the
+    // exclusion set (loopback, link-local, or a Russian address carried by
+    // `geoip:ru`) is already direct, and the relay address is excluded
+    // separately, so the general `ip daddr` rule below covers every case the
+    // port exemption used to.
     if inverted {
         let _ = writeln!(
             out,
@@ -539,19 +539,6 @@ pub fn render_ruleset(ruleset: &CompiledRuleset) -> String {
     let _ = writeln!(out, "\t}}");
     let _ = writeln!(out, "}}");
     out
-}
-
-/// Renders the DNS bypass statements used in inverted mode.
-///
-/// The resolver ports are exempted from marking so a lookup leaves directly,
-/// even though every other destination would be tunnelled.
-fn render_dns_bypass() -> Vec<String> {
-    vec![
-        "meta l4proto udp th dport 53 return".to_owned(),
-        "meta l4proto tcp th dport 53 return".to_owned(),
-        "meta l4proto tcp th dport 853 return".to_owned(),
-        "meta l4proto udp th dport 853 return".to_owned(),
-    ]
 }
 
 /// Renders the block rules into their own table.
@@ -1000,14 +987,16 @@ mod tests {
     }
 
     #[test]
-    fn dns_is_never_marked_in_inverted_mode() {
+    fn dns_ports_are_not_exempted_in_inverted_mode() {
         let table = table_from_json(r#"{"rules":[{"ip":["1.1.1.1"],"outboundTag":"direct"}]}"#);
         let ruleset = compile_ruleset(&table, &std::collections::HashMap::new());
         let script = render_ruleset(&ruleset);
-        // Lookups must egress directly, or resolving a white-listed domain
-        // through the tunnel would return foreign addresses.
-        assert!(script.contains("meta l4proto udp th dport 53 return"));
-        assert!(script.contains("meta l4proto tcp th dport 53 return"));
+        // A blanket port exemption would leak a lookup to a foreign resolver
+        // in the clear; a resolver that must stay direct is either loopback /
+        // link-local (already in the infra set) or carried by the white list.
+        assert!(!script.contains("th dport 53"));
+        assert!(!script.contains("th dport 853"));
+        assert!(script.contains("ip daddr != @direct_v4 meta mark set 0x77647400"));
     }
 
     #[test]

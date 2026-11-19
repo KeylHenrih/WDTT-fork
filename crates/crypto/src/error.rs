@@ -28,4 +28,7 @@ pub enum CryptoError {
 
     #[error("expired knock timestamp: clock skew {skew_ms}ms exceeds threshold {max_skew_ms}ms")]
     KnockTimestampExpired { skew_ms: u64, max_skew_ms: u64 },
+
+    #[error("malformed DTLS record: {detail}")]
+    InvalidRecord { detail: String },
 }
