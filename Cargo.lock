@@ -3520,11 +3520,14 @@ dependencies = [
 name = "wdtt-gui"
 version = "0.1.0"
 dependencies = [
+ "postcard",
+ "serde_json",
  "tao",
  "thiserror 2.0.21",
  "tracing",
  "tracing-subscriber",
  "url",
+ "wdtt-ipc",
  "webkit2gtk",
  "wry",
 ]
