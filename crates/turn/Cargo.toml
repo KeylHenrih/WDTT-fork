@@ -19,7 +19,7 @@ socket2 = { workspace = true }
 libc = { workspace = true }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
-webpki-roots = "0.26"
+webpki-roots = "1.0"
 
 [dev-dependencies]
 proptest = { workspace = true }
